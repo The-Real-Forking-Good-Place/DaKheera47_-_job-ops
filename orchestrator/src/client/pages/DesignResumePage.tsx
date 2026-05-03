@@ -22,6 +22,18 @@ import {
 import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
+import { showErrorToast } from "@/client/lib/error-toast";
+import { downloadDesignResumePdf } from "@/client/lib/private-pdf";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -44,6 +56,7 @@ import {
   getDesignResumeDialogItem,
   makeDownload,
 } from "../components/design-resume/utils";
+import { formatUserFacingError } from "../lib/error-format";
 import { queryKeys } from "../lib/queryKeys";
 
 export const DesignResumePage: React.FC = () => {
@@ -62,6 +75,7 @@ export const DesignResumePage: React.FC = () => {
   const [mobileRailOpen, setMobileRailOpen] = useState(false);
   const [pictureUploading, setPictureUploading] = useState(false);
   const [resumeImporting, setResumeImporting] = useState(false);
+  const [showReimportConfirm, setShowReimportConfirm] = useState(false);
   const [pdfDownloading, setPdfDownloading] = useState(false);
   const [rendererUpdating, setRendererUpdating] = useState(false);
   const [dirty, setDirty] = useState(false);
@@ -128,11 +142,7 @@ export const DesignResumePage: React.FC = () => {
         setSaveState("idle");
       } catch (saveError) {
         setSaveState("error");
-        toast.error(
-          saveError instanceof Error
-            ? saveError.message
-            : "Failed to save Design Resume.",
-        );
+        showErrorToast(saveError, "Failed to save Design Resume.");
       }
     }, 700);
 
@@ -233,11 +243,15 @@ export const DesignResumePage: React.FC = () => {
       toast.success("Imported your resume.");
     } catch (importError) {
       setSaveState("error");
-      toast.error(
-        importError instanceof Error
-          ? importError.message
-          : "Failed to import your resume.",
-      );
+      showErrorToast(importError, "Failed to import your resume.");
+    }
+  };
+
+  const handleImportWithConfirm = () => {
+    if (status?.exists) {
+      setShowReimportConfirm(true);
+    } else {
+      void handleImport();
     }
   };
 
@@ -261,11 +275,7 @@ export const DesignResumePage: React.FC = () => {
       toast.success("Imported your resume file.");
     } catch (importError) {
       setSaveState("error");
-      toast.error(
-        importError instanceof Error
-          ? importError.message
-          : "Failed to import your resume file.",
-      );
+      showErrorToast(importError, "Failed to import your resume file.");
     } finally {
       setResumeImporting(false);
       if (importFileInputRef.current) {
@@ -280,11 +290,7 @@ export const DesignResumePage: React.FC = () => {
       makeDownload(exported.fileName, exported.document);
       toast.success("Exported your resume JSON.");
     } catch (exportError) {
-      toast.error(
-        exportError instanceof Error
-          ? exportError.message
-          : "Failed to export Design Resume.",
-      );
+      showErrorToast(exportError, "Failed to export Design Resume.");
     }
   };
 
@@ -292,17 +298,10 @@ export const DesignResumePage: React.FC = () => {
     try {
       setPdfDownloading(true);
       const generated = await api.generateDesignResumePdf();
-      const anchor = window.document.createElement("a");
-      anchor.href = generated.pdfUrl;
-      anchor.download = generated.fileName;
-      anchor.click();
+      await downloadDesignResumePdf(generated.fileName);
       toast.success("Your PDF is ready.");
     } catch (downloadError) {
-      toast.error(
-        downloadError instanceof Error
-          ? downloadError.message
-          : "Failed to generate a PDF.",
-      );
+      showErrorToast(downloadError, "Failed to generate a PDF.");
     } finally {
       setPdfDownloading(false);
     }
@@ -338,11 +337,7 @@ export const DesignResumePage: React.FC = () => {
       }
       toast.success("Picture uploaded.");
     } catch (uploadError) {
-      toast.error(
-        uploadError instanceof Error
-          ? uploadError.message
-          : "Failed to upload picture.",
-      );
+      showErrorToast(uploadError, "Failed to upload picture.");
     } finally {
       setPictureUploading(false);
       if (fileInputRef.current) {
@@ -377,11 +372,7 @@ export const DesignResumePage: React.FC = () => {
       }
       toast.success("Picture removed.");
     } catch (deleteError) {
-      toast.error(
-        deleteError instanceof Error
-          ? deleteError.message
-          : "Failed to delete picture.",
-      );
+      showErrorToast(deleteError, "Failed to delete picture.");
     }
   };
 
@@ -400,11 +391,7 @@ export const DesignResumePage: React.FC = () => {
           : "React Resume Renderer is now active.",
       );
     } catch (updateError) {
-      toast.error(
-        updateError instanceof Error
-          ? updateError.message
-          : "Failed to update the resume template.",
-      );
+      showErrorToast(updateError, "Failed to update the resume template.");
     } finally {
       setRendererUpdating(false);
     }
@@ -509,7 +496,11 @@ export const DesignResumePage: React.FC = () => {
                 {resumeImporting ? "Importing File" : "Import File"}
               </Button>
 
-              <Button type="button" variant="outline" onClick={handleImport}>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={handleImportWithConfirm}
+              >
                 <Import className="mr-2 h-4 w-4" />
                 {status?.exists ? "Re-import RxResume" : "Import RxResume"}
               </Button>
@@ -555,7 +546,7 @@ export const DesignResumePage: React.FC = () => {
                   <Import className="mr-2 h-4 w-4" />
                   {resumeImporting ? "Importing File" : "Import File"}
                 </DropdownMenuItem>
-                <DropdownMenuItem onSelect={() => handleImport()}>
+                <DropdownMenuItem onSelect={() => handleImportWithConfirm()}>
                   <Import className="mr-2 h-4 w-4" />
                   {status?.exists ? "Re-import RxResume" : "Import RxResume"}
                 </DropdownMenuItem>
@@ -600,9 +591,10 @@ export const DesignResumePage: React.FC = () => {
                 </Button>
                 {error ? (
                   <div className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-4 py-2 text-sm text-rose-300">
-                    {error instanceof Error
-                      ? error.message
-                      : "Unable to load Design Resume."}
+                    {formatUserFacingError(
+                      error,
+                      "Unable to load Design Resume.",
+                    )}
                   </div>
                 ) : null}
               </div>
@@ -668,6 +660,8 @@ export const DesignResumePage: React.FC = () => {
                 ...sections,
                 [dialogState.definition.key]: {
                   ...section,
+                  // Ensure the edited section is visible in rendered output.
+                  hidden: false,
                   items: nextItems,
                 },
               } as DesignResumeJson["sections"];
@@ -694,6 +688,8 @@ export const DesignResumePage: React.FC = () => {
                       ...sections,
                       [dialogState.definition.key]: {
                         ...section,
+                        // Keep section visible after inline list edits.
+                        hidden: false,
                         items,
                       },
                     } as DesignResumeJson["sections"];
@@ -704,6 +700,35 @@ export const DesignResumePage: React.FC = () => {
           }
         />
       ) : null}
+
+      <AlertDialog
+        open={showReimportConfirm}
+        onOpenChange={setShowReimportConfirm}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Re-import from RxResume?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will replace your current Design Resume with the latest data
+              from RxResume. Any edits you've made here will be permanently
+              overwritten and cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-[#F1703E] text-white hover:bg-[#d9612f]"
+              onClick={() => {
+                setShowReimportConfirm(false);
+                void handleImport();
+              }}
+            >
+              <Import className="mr-2 h-4 w-4" />
+              Re-import
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </>
   );
 };

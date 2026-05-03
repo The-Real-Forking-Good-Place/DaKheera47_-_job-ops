@@ -144,12 +144,18 @@ describe("settingsRegistry helpers", () => {
       expect(settingsRegistry.showSponsorInfo.parse("true")).toBe(true);
       expect(settingsRegistry.showSponsorInfo.parse("0")).toBe(false);
       expect(settingsRegistry.showSponsorInfo.parse("false")).toBe(false);
+      expect(settingsRegistry.showSponsorInfo.parse("2")).toBeNull();
+      expect(settingsRegistry.showSponsorInfo.parse("yes")).toBeNull();
       expect(settingsRegistry.showSponsorInfo.parse("")).toBeNull();
       expect(settingsRegistry.showSponsorInfo.parse(undefined)).toBeNull();
       expect(settingsRegistry.renderMarkdownInJobDescriptions.parse("1")).toBe(
         true,
       );
       expect(settingsRegistry.renderMarkdownInJobDescriptions.parse("0")).toBe(
+        false,
+      );
+      expect(settingsRegistry.ghostwriterStopSlopEnabled.parse("1")).toBe(true);
+      expect(settingsRegistry.ghostwriterStopSlopEnabled.parse("0")).toBe(
         false,
       );
     });
@@ -165,6 +171,12 @@ describe("settingsRegistry helpers", () => {
       expect(
         settingsRegistry.renderMarkdownInJobDescriptions.serialize(false),
       ).toBe("0");
+      expect(settingsRegistry.ghostwriterStopSlopEnabled.serialize(true)).toBe(
+        "1",
+      );
+      expect(settingsRegistry.ghostwriterStopSlopEnabled.serialize(false)).toBe(
+        "0",
+      );
     });
   });
 
@@ -301,9 +313,21 @@ describe("settingsRegistry helpers", () => {
       );
     });
 
+    it("accepts gemini_cli including hyphenated alias", () => {
+      expect(settingsRegistry.llmProvider.parse("gemini_cli")).toBe(
+        "gemini_cli",
+      );
+      expect(settingsRegistry.llmProvider.parse("gemini-cli")).toBe(
+        "gemini_cli",
+      );
+    });
+
     it("uses provider-specific default models", () => {
       expect(getDefaultModelForProvider("openai")).toBe("gpt-5.4-mini");
       expect(getDefaultModelForProvider("gemini")).toBe(
+        "google/gemini-3-flash-preview",
+      );
+      expect(getDefaultModelForProvider("gemini_cli")).toBe(
         "google/gemini-3-flash-preview",
       );
       expect(getDefaultModelForProvider("codex")).toBe("");

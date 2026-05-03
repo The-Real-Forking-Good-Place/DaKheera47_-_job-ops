@@ -21,6 +21,10 @@ import {
 import * as jobsRepo from "@server/repositories/jobs";
 import * as settingsRepo from "@server/repositories/settings";
 import {
+  reconcileActivationMilestonesFromHistorySafely,
+  trackCanonicalActivationEvent,
+} from "@server/services/activation-funnel";
+import {
   deleteStageEvent,
   getStageEvents,
   getTasks,
@@ -37,6 +41,7 @@ import {
   simulateSummarizeJob,
 } from "@server/services/demo-simulator";
 import { uploadJobPdf } from "@server/services/job-pdf-upload";
+import { getPdfPath, pdfExists } from "@server/services/pdf";
 import { getProfile } from "@server/services/profile";
 import { scoreJobSuitability } from "@server/services/scorer";
 import { getTracerReadiness } from "@server/services/tracer-links";
@@ -51,6 +56,7 @@ import {
   type JobActionResult,
   type JobActionStreamEvent,
   type JobListItem,
+  type JobOutcome,
   type JobStatus,
   type JobsListResponse,
   type JobsRevisionResponse,
@@ -189,7 +195,7 @@ const updateJobSchema = z.object({
 
 function isJobUrlConflictError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
-  return /UNIQUE constraint failed: jobs\.job_url/i.test(error.message);
+  return /UNIQUE constraint failed: .*jobs\.job_url/i.test(error.message);
 }
 
 const transitionStageSchema = z.object({
@@ -291,6 +297,34 @@ function resolveRequestOrigin(req: Request): string | null {
   return `${protocol}://${host}`;
 }
 
+function trackApplicationAcceptedIfNeeded(args: {
+  closedAt?: number | null;
+  nextOutcome: JobOutcome | null;
+  previousOutcome: JobOutcome | null;
+  requestOrigin?: string | null;
+  source: string;
+}): void {
+  if (
+    args.nextOutcome !== "offer_accepted" ||
+    args.previousOutcome === "offer_accepted"
+  ) {
+    return;
+  }
+
+  void trackCanonicalActivationEvent(
+    "application_accepted",
+    {
+      source: args.source,
+    },
+    {
+      occurredAt:
+        typeof args.closedAt === "number" ? args.closedAt * 1000 : Date.now(),
+      requestOrigin: args.requestOrigin ?? null,
+      urlPath: "/applications/in-progress",
+    },
+  );
+}
+
 function mapErrorForResult(error: unknown): {
   code: string;
   message: string;
@@ -315,6 +349,37 @@ function mapErrorForResult(error: unknown): {
     code: "INTERNAL_ERROR",
     message: "Unknown error",
   };
+}
+
+const STATUS_BY_APP_ERROR_CODE: Record<AppErrorCode, number> = {
+  INVALID_REQUEST: 400,
+  UNAUTHORIZED: 401,
+  FORBIDDEN: 403,
+  NOT_FOUND: 404,
+  REQUEST_TIMEOUT: 408,
+  CONFLICT: 409,
+  UNPROCESSABLE_ENTITY: 422,
+  SERVICE_UNAVAILABLE: 503,
+  UPSTREAM_ERROR: 502,
+  INTERNAL_ERROR: 500,
+};
+
+function appErrorFromPipelineFailure(
+  result: { error?: string; errorCode?: AppErrorCode },
+  fallbackMessage: string,
+): AppError {
+  const code =
+    result.errorCode ?? (result.error === "Job not found" ? "NOT_FOUND" : null);
+
+  if (!code) {
+    return badRequest(result.error ?? fallbackMessage);
+  }
+
+  return new AppError({
+    status: STATUS_BY_APP_ERROR_CODE[code],
+    code,
+    message: result.error ?? fallbackMessage,
+  });
 }
 
 type JobActionExecutionOptions = {
@@ -495,24 +560,14 @@ async function executeJobActionForJob(
 function mapJobActionFailure(
   failure: Extract<JobActionResult, { ok: false }>,
 ): AppError {
-  const statusByCode: Record<AppErrorCode, number> = {
-    INVALID_REQUEST: 400,
-    UNAUTHORIZED: 401,
-    FORBIDDEN: 403,
-    NOT_FOUND: 404,
-    REQUEST_TIMEOUT: 408,
-    CONFLICT: 409,
-    UNPROCESSABLE_ENTITY: 422,
-    SERVICE_UNAVAILABLE: 503,
-    UPSTREAM_ERROR: 502,
-    INTERNAL_ERROR: 500,
-  };
   const code = (
-    failure.error.code in statusByCode ? failure.error.code : "INTERNAL_ERROR"
+    failure.error.code in STATUS_BY_APP_ERROR_CODE
+      ? failure.error.code
+      : "INTERNAL_ERROR"
   ) as AppErrorCode;
 
   return new AppError({
-    status: statusByCode[code],
+    status: STATUS_BY_APP_ERROR_CODE[code],
     code,
     message: failure.error.message,
   });
@@ -1242,6 +1297,12 @@ jobsRouter.post("/:id/stages", async (req: Request, res: Response) => {
       input.outcome ?? null,
     );
     ok(res, event);
+    queueMicrotask(() => {
+      void reconcileActivationMilestonesFromHistorySafely({
+        route: "POST /api/jobs/:id/stages",
+        jobId: req.params.id,
+      });
+    });
   } catch (error) {
     if (error instanceof z.ZodError) {
       return fail(res, badRequest(error.message, error.flatten()));
@@ -1260,6 +1321,13 @@ jobsRouter.patch(
       const input = updateStageEventSchema.parse(req.body);
       updateStageEvent(req.params.eventId, input);
       ok(res, null);
+      queueMicrotask(() => {
+        void reconcileActivationMilestonesFromHistorySafely({
+          route: "PATCH /api/jobs/:id/events/:eventId",
+          jobId: req.params.id,
+          eventId: req.params.eventId,
+        });
+      });
     } catch (error) {
       if (error instanceof z.ZodError) {
         return fail(res, badRequest(error.message, error.flatten()));
@@ -1278,6 +1346,13 @@ jobsRouter.delete(
     try {
       deleteStageEvent(req.params.eventId);
       ok(res, null);
+      queueMicrotask(() => {
+        void reconcileActivationMilestonesFromHistorySafely({
+          route: "DELETE /api/jobs/:id/events/:eventId",
+          jobId: req.params.id,
+          eventId: req.params.eventId,
+        });
+      });
     } catch (error) {
       fail(res, toAppError(error));
     }
@@ -1290,6 +1365,10 @@ jobsRouter.delete(
 jobsRouter.patch("/:id/outcome", async (req: Request, res: Response) => {
   try {
     const input = updateOutcomeSchema.parse(req.body);
+    const currentJob = await jobsRepo.getJobById(req.params.id);
+    if (!currentJob) {
+      return fail(res, notFound("Job not found"));
+    }
     const closedAt = input.outcome
       ? (input.closedAt ?? Math.floor(Date.now() / 1000))
       : null;
@@ -1302,7 +1381,21 @@ jobsRouter.patch("/:id/outcome", async (req: Request, res: Response) => {
       return fail(res, notFound("Job not found"));
     }
 
+    trackApplicationAcceptedIfNeeded({
+      closedAt: job.closedAt,
+      nextOutcome: job.outcome,
+      previousOutcome: currentJob.outcome,
+      requestOrigin: resolveRequestOrigin(req),
+      source: "jobs_outcome_route",
+    });
+
     ok(res, job);
+    queueMicrotask(() => {
+      void reconcileActivationMilestonesFromHistorySafely({
+        route: "PATCH /api/jobs/:id/outcome",
+        jobId: req.params.id,
+      });
+    });
   } catch (error) {
     if (error instanceof z.ZodError) {
       return fail(res, badRequest(error.message, error.flatten()));
@@ -1382,7 +1475,27 @@ jobsRouter.patch("/:id", async (req: Request, res: Response) => {
       updatedFields: Object.keys(input),
     });
 
+    trackApplicationAcceptedIfNeeded({
+      closedAt: job.closedAt,
+      nextOutcome: job.outcome,
+      previousOutcome: currentJob.outcome,
+      requestOrigin: resolveRequestOrigin(req),
+      source: "jobs_patch_route",
+    });
     ok(res, job);
+    if (
+      Object.hasOwn(input, "appliedAt") ||
+      Object.hasOwn(input, "closedAt") ||
+      Object.hasOwn(input, "outcome")
+    ) {
+      queueMicrotask(() => {
+        void reconcileActivationMilestonesFromHistorySafely({
+          route: "PATCH /api/jobs/:id",
+          jobId: req.params.id,
+          updatedFields: Object.keys(input),
+        });
+      });
+    }
   } catch (error) {
     const err =
       error instanceof z.ZodError
@@ -1518,6 +1631,22 @@ jobsRouter.post("/:id/pdf", async (req: Request, res: Response) => {
   }
 });
 
+jobsRouter.get("/:id/pdf", async (req: Request, res: Response) => {
+  const currentJob = await jobsRepo.getJobById(req.params.id);
+  if (!currentJob || !(await pdfExists(req.params.id))) {
+    fail(res, notFound("PDF not found"));
+    return;
+  }
+
+  const pdfPath = getPdfPath(req.params.id);
+  res.setHeader("Cache-Control", "private, max-age=60");
+  res.sendFile(pdfPath, (error) => {
+    if (error) {
+      fail(res, notFound("PDF not found"));
+    }
+  });
+});
+
 /**
  * POST /api/jobs/:id/summarize - Generate AI summary and suggest projects
  */
@@ -1648,7 +1777,7 @@ jobsRouter.post("/:id/generate-pdf", async (req: Request, res: Response) => {
     if (!result.success) {
       return fail(
         res,
-        badRequest(result.error ?? "Failed to generate a resume PDF"),
+        appErrorFromPipelineFailure(result, "Failed to generate a resume PDF"),
       );
     }
 
@@ -1698,7 +1827,7 @@ jobsRouter.post("/:id/apply", async (req: Request, res: Response) => {
     });
 
     if (updatedJob) {
-      void trackServerProductEvent(
+      void trackCanonicalActivationEvent(
         "application_marked_applied",
         {
           source: "jobs_apply_route",
@@ -1709,6 +1838,7 @@ jobsRouter.post("/:id/apply", async (req: Request, res: Response) => {
             updatedJob.sponsorMatchScore >= 50,
         },
         {
+          occurredAt: appliedAtDate,
           requestOrigin: resolveRequestOrigin(req),
           urlPath: "/jobs",
         },

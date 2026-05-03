@@ -33,9 +33,14 @@ import type {
   JobsListResponse,
   JobsRevisionResponse,
   JobTracerLinksResponse,
+  LocationMatchStrictness,
+  LocationSearchScope,
   ManualJobDraft,
   ManualJobFetchResponse,
   ManualJobInferenceResponse,
+  PipelineProgressState,
+  PipelineRun,
+  PipelineRunInsights,
   PipelineStatusResponse,
   PostApplicationAction,
   PostApplicationActionResponse,
@@ -59,7 +64,12 @@ import type {
   VisaSponsorSearchResponse,
   VisaSponsorStatusResponse,
 } from "@shared/types";
-import { bucketQueryLength, trackProductEvent } from "@/lib/analytics";
+import { formatUserFacingError } from "@/client/lib/error-format";
+import {
+  bucketQueryLength,
+  getAnalyticsRequestHeaders,
+  trackProductEvent,
+} from "@/lib/analytics";
 import { showDemoBlockedToast, showDemoSimulatedToast } from "@/lib/demo-toast";
 
 const API_BASE = "/api";
@@ -73,10 +83,9 @@ class ApiClientError extends Error {
     message: string,
     options?: { requestId?: string; status?: number; code?: string },
   ) {
-    const requestId = options?.requestId;
-    super(requestId ? `${message} (requestId: ${requestId})` : message);
+    super(message);
     this.name = "ApiClientError";
-    this.requestId = requestId;
+    this.requestId = options?.requestId;
     this.status = options?.status;
     this.code = options?.code;
   }
@@ -116,6 +125,22 @@ export type CodexAuthStatusResponse = {
 export type AuthCredentials = {
   username: string;
   password: string;
+};
+
+export type AuthUser = {
+  id: string;
+  username: string;
+  displayName: string | null;
+  isSystemAdmin: boolean;
+  isDisabled: boolean;
+  workspaceId: string;
+  workspaceName: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type AuthBootstrapStatus = {
+  setupRequired: boolean;
 };
 
 type StoredLegacyAuthCredentials = AuthCredentials & {
@@ -269,6 +294,46 @@ export async function signInWithCredentials(
   setAuthenticatedSession(token);
 }
 
+export async function getAuthBootstrapStatus(): Promise<AuthBootstrapStatus> {
+  return fetchApi<AuthBootstrapStatus>("/auth/bootstrap-status");
+}
+
+export async function setupFirstAdmin(input: {
+  username: string;
+  password: string;
+  displayName?: string;
+}): Promise<AuthUser> {
+  const res = await fetch("/api/auth/setup", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  const parsed = await readAuthResponse<{
+    token: string;
+    user: AuthUser;
+  }>(res);
+  if ("ok" in parsed) {
+    if (!parsed.ok) throw toApiError(res, parsed);
+    if (!parsed.data?.token || !parsed.data.user) {
+      throw new Error("Setup response was incomplete");
+    }
+    setAuthenticatedSession(parsed.data.token);
+    return parsed.data.user;
+  }
+  if (!parsed.success) throw toApiError(res, parsed);
+  const data = parsed.data as { token?: string; user?: AuthUser } | undefined;
+  if (!data?.token || !data.user) {
+    throw new Error("Setup response was incomplete");
+  }
+  setAuthenticatedSession(data.token);
+  return data.user;
+}
+
+export async function getCurrentAuthUser(): Promise<AuthUser> {
+  const result = await fetchApi<{ user: AuthUser }>("/auth/me");
+  return result.user;
+}
+
 export async function restoreAuthSessionFromLegacyCredentials(): Promise<boolean> {
   if (cachedAuthToken) return true;
   if (!cachedLegacyCredentials) return false;
@@ -310,7 +375,9 @@ export async function recoverAuthHeaderAfterUnauthorized(): Promise<
   return recoverAuthSessionFromUnauthorized();
 }
 
-export async function logout(): Promise<void> {
+export async function logout(
+  options: { redirect?: boolean } = {},
+): Promise<void> {
   if (cachedAuthToken) {
     try {
       await fetch("/api/auth/logout", {
@@ -322,7 +389,9 @@ export async function logout(): Promise<void> {
     }
   }
   clearAuthSession();
-  redirectToSignIn();
+  if (options.redirect ?? true) {
+    redirectToSignIn();
+  }
 }
 
 export function getCachedAuthHeader(): string | undefined {
@@ -331,6 +400,58 @@ export function getCachedAuthHeader(): string | undefined {
 
 export function hasAuthenticatedSession(): boolean {
   return Boolean(cachedAuthToken);
+}
+
+export async function listWorkspaceUsers(): Promise<AuthUser[]> {
+  const result = await fetchApi<{ users: AuthUser[] }>("/workspaces/users");
+  return result.users;
+}
+
+export async function createWorkspaceUser(input: {
+  username: string;
+  password: string;
+  displayName?: string;
+  isSystemAdmin?: boolean;
+}): Promise<AuthUser> {
+  const result = await fetchApi<{ user: AuthUser }>("/workspaces/users", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  return result.user;
+}
+
+export async function setWorkspaceUserDisabled(
+  userId: string,
+  isDisabled: boolean,
+): Promise<AuthUser> {
+  const result = await fetchApi<{ user: AuthUser }>(
+    `/workspaces/users/${encodeURIComponent(userId)}/disabled`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ isDisabled }),
+    },
+  );
+  return result.user;
+}
+
+export async function resetWorkspaceUserPassword(
+  userId: string,
+  password: string,
+): Promise<void> {
+  await fetchApi<{ userId: string }>(
+    `/workspaces/users/${encodeURIComponent(userId)}/reset-password`,
+    {
+      method: "POST",
+      body: JSON.stringify({ password }),
+    },
+  );
+}
+
+export async function changeOwnPassword(password: string): Promise<void> {
+  await fetchApi<{ userId: string }>("/workspaces/me/password", {
+    method: "POST",
+    body: JSON.stringify({ password }),
+  });
 }
 
 export function __resetApiClientAuthForTests(): void {
@@ -428,11 +549,20 @@ function toApiError<T>(
 ): ApiClientError {
   if ("ok" in parsed) {
     if (!parsed.ok) {
-      return new ApiClientError(parsed.error.message || "API request failed", {
-        requestId: parsed.meta?.requestId,
-        status: response.status,
-        code: parsed.error.code,
-      });
+      return new ApiClientError(
+        formatUserFacingError(
+          {
+            message: parsed.error.message || "API request failed",
+            details: parsed.error.details,
+          },
+          "API request failed",
+        ),
+        {
+          requestId: parsed.meta?.requestId,
+          status: response.status,
+          code: parsed.error.code,
+        },
+      );
     }
     return new ApiClientError("API request failed", {
       requestId: parsed.meta?.requestId,
@@ -440,12 +570,15 @@ function toApiError<T>(
     });
   }
   if (parsed.success) {
-    return new ApiClientError(parsed.message || "API request failed", {
-      status: response.status,
-    });
+    return new ApiClientError(
+      formatUserFacingError(parsed.message || "API request failed"),
+      {
+        status: response.status,
+      },
+    );
   }
   return new ApiClientError(
-    parsed.error || parsed.message || "API request failed",
+    formatUserFacingError(parsed, "API request failed"),
     {
       status: response.status,
     },
@@ -462,6 +595,7 @@ async function fetchAndParse<T>(
 }> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
+    ...getAnalyticsRequestHeaders(),
     ...normalizeHeaders(options?.headers),
   };
   if (authHeader) headers.Authorization = authHeader;
@@ -543,6 +677,42 @@ async function fetchApi<T>(
     if (data !== undefined) return data as T;
     if (parsed.message !== undefined) return { message: parsed.message } as T;
     return null as T;
+  }
+}
+
+async function fetchBlobApi(
+  endpoint: string,
+  options?: RequestInit,
+): Promise<Blob> {
+  let authHeader = getAuthHeader();
+  let authAttempt = 0;
+
+  while (true) {
+    const headers: Record<string, string> = {
+      ...getAnalyticsRequestHeaders(),
+      ...normalizeHeaders(options?.headers),
+    };
+    if (authHeader) headers.Authorization = authHeader;
+    const response = await fetch(`${API_BASE}${endpoint}`, {
+      ...options,
+      headers,
+    });
+
+    if (response.status === 401 && authAttempt < 1) {
+      const recoveredAuthHeader = await recoverAuthSessionFromUnauthorized();
+      if (recoveredAuthHeader) {
+        authHeader = recoveredAuthHeader;
+        authAttempt += 1;
+        continue;
+      }
+    }
+
+    if (!response.ok) {
+      const parsed = await readAuthResponse<never>(response);
+      throw toApiError(response, parsed);
+    }
+
+    return response.blob();
   }
 }
 
@@ -644,6 +814,10 @@ export async function uploadJobPdf(
   });
 }
 
+export async function getJobPdfBlob(id: string): Promise<Blob> {
+  return fetchBlobApi(`/jobs/${encodeURIComponent(id)}/pdf`);
+}
+
 export async function getTracerAnalytics(options?: {
   jobId?: string;
   from?: number;
@@ -717,6 +891,7 @@ async function streamSseEvents<TEvent>(
 ): Promise<void> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
+    ...getAnalyticsRequestHeaders(),
   };
   const streamAuth = getAuthHeader();
   if (streamAuth) {
@@ -751,7 +926,13 @@ async function streamSseEvents<TEvent>(
       const payload = await response.json();
       const parsed = normalizeApiResponse(payload);
       if ("ok" in parsed && !parsed.ok) {
-        errorMessage = parsed.error.message || errorMessage;
+        errorMessage = formatUserFacingError(
+          {
+            message: parsed.error.message || errorMessage,
+            details: parsed.error.details,
+          },
+          errorMessage,
+        );
       }
     } catch {
       // ignore parse errors; keep status-based message
@@ -1136,7 +1317,7 @@ function getSingleJobFromActionResult(
     throw new ApiClientError("Job action did not return a result for the job");
   }
   if (!result.ok) {
-    throw new ApiClientError(result.error.message, {
+    throw new ApiClientError(formatUserFacingError(result.error.message), {
       code: result.error.code,
     });
   }
@@ -1227,10 +1408,62 @@ export async function getPipelineStatus(): Promise<PipelineStatusResponse> {
   return fetchApi<PipelineStatusResponse>("/pipeline/status");
 }
 
+export async function getPipelineProgressSnapshot(): Promise<PipelineProgressState> {
+  return fetchApi<PipelineProgressState>("/pipeline/progress/snapshot");
+}
+
+export async function getPipelineRuns(): Promise<PipelineRun[]> {
+  return fetchApi<PipelineRun[]>("/pipeline/runs");
+}
+
+export async function prepareChallengeViewer(): Promise<{
+  available: boolean;
+  viewerUrl: string | null;
+  reason: string | null;
+}> {
+  return fetchApi<{
+    available: boolean;
+    viewerUrl: string | null;
+    reason: string | null;
+  }>("/pipeline/challenge-viewer", {
+    method: "POST",
+  });
+}
+
+export async function solvePipelineChallenge(extractorId: string): Promise<{
+  status: "solved";
+  extractorId: string;
+  challengesRemaining: number;
+}> {
+  return fetchApi<{
+    status: "solved";
+    extractorId: string;
+    challengesRemaining: number;
+  }>("/pipeline/solve-challenge", {
+    method: "POST",
+    body: JSON.stringify({ extractorId }),
+  });
+}
+
+export async function getPipelineRunInsights(
+  id: string,
+): Promise<PipelineRunInsights> {
+  return fetchApi<PipelineRunInsights>(
+    `/pipeline/runs/${encodeURIComponent(id)}/insights`,
+  );
+}
+
 export async function runPipeline(config?: {
   topN?: number;
   minSuitabilityScore?: number;
   sources?: JobSource[];
+  runBudget?: number;
+  searchTerms?: string[];
+  country?: string;
+  cityLocations?: string[];
+  workplaceTypes?: Array<"remote" | "hybrid" | "onsite">;
+  searchScope?: LocationSearchScope;
+  matchStrictness?: LocationMatchStrictness;
 }): Promise<{ message: string }> {
   return fetchApi<{ message: string }>("/pipeline/run", {
     method: "POST",
@@ -1551,18 +1784,8 @@ export async function getProfileProjects(): Promise<
 export async function getResumeProjectsCatalog(): Promise<
   ResumeProjectCatalogItem[]
 > {
-  try {
-    const settings = await getSettings();
-    if (settings.rxresumeBaseResumeId) {
-      return await getRxResumeProjects(
-        settings.rxresumeBaseResumeId,
-        undefined,
-      );
-    }
-  } catch {
-    // fall through to profile-based projects
-  }
-
+  // Always resolve from /profile/projects so local Design Resume edits
+  // propagate to active and future application tailoring flows.
   return getProfileProjects();
 }
 
@@ -1634,6 +1857,10 @@ export async function generateDesignResumePdf(): Promise<DesignResumePdfResponse
   return fetchApi<DesignResumePdfResponse>("/design-resume/generate-pdf", {
     method: "POST",
   });
+}
+
+export async function getDesignResumePdfBlob(): Promise<Blob> {
+  return fetchBlobApi("/design-resume/pdf");
 }
 
 export async function getProfileStatus(): Promise<ProfileStatusResponse> {

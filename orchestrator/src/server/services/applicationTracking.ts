@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { trackServerProductEvent } from "@infra/product-analytics";
+import { trackCanonicalActivationEvent } from "@server/services/activation-funnel";
 import type {
   ApplicationStage,
   ApplicationTask,
@@ -12,6 +13,7 @@ import type {
 import { and, asc, desc, eq } from "drizzle-orm";
 import { z } from "zod";
 import { db, schema } from "../db/index";
+import { getActiveTenantId } from "../tenancy/context";
 
 const { jobs, stageEvents, tasks } = schema;
 
@@ -60,10 +62,16 @@ export const stageEventMetadataSchema = z
 export async function getStageEvents(
   applicationId: string,
 ): Promise<StageEvent[]> {
+  const tenantId = getActiveTenantId();
   const rows = await db
     .select()
     .from(stageEvents)
-    .where(eq(stageEvents.applicationId, applicationId))
+    .where(
+      and(
+        eq(stageEvents.tenantId, tenantId),
+        eq(stageEvents.applicationId, applicationId),
+      ),
+    )
     .orderBy(asc(stageEvents.occurredAt));
 
   return rows.map((row) => ({
@@ -83,13 +91,18 @@ export async function getTasks(
   applicationId: string,
   includeCompleted = false,
 ): Promise<ApplicationTask[]> {
+  const tenantId = getActiveTenantId();
   const rows = await db
     .select()
     .from(tasks)
     .where(
       includeCompleted
-        ? eq(tasks.applicationId, applicationId)
+        ? and(
+            eq(tasks.tenantId, tenantId),
+            eq(tasks.applicationId, applicationId),
+          )
         : and(
+            eq(tasks.tenantId, tenantId),
             eq(tasks.applicationId, applicationId),
             eq(tasks.isCompleted, false),
           ),
@@ -120,9 +133,14 @@ export function transitionStage(
 
   const now = Math.floor(Date.now() / 1000);
   const timestamp = occurredAt ?? now;
+  const tenantId = getActiveTenantId();
 
-  const event = db.transaction((tx) => {
-    const job = tx.select().from(jobs).where(eq(jobs.id, applicationId)).get();
+  const { event, previousOutcome } = db.transaction((tx) => {
+    const job = tx
+      .select()
+      .from(jobs)
+      .where(and(eq(jobs.tenantId, tenantId), eq(jobs.id, applicationId)))
+      .get();
     if (!job) {
       throw new Error("Job not found");
     }
@@ -130,7 +148,12 @@ export function transitionStage(
     const lastEvent = tx
       .select()
       .from(stageEvents)
-      .where(eq(stageEvents.applicationId, applicationId))
+      .where(
+        and(
+          eq(stageEvents.tenantId, tenantId),
+          eq(stageEvents.applicationId, applicationId),
+        ),
+      )
       .orderBy(desc(stageEvents.occurredAt))
       .limit(1)
       .get();
@@ -145,6 +168,7 @@ export function transitionStage(
     tx.insert(stageEvents)
       .values({
         id: eventId,
+        tenantId,
         applicationId,
         title: parsedMetadata?.eventLabel ?? finalToStage,
         groupId: parsedMetadata?.groupId ?? null,
@@ -177,22 +201,28 @@ export function transitionStage(
       updates.closedAt = timestamp;
     }
 
-    tx.update(jobs).set(updates).where(eq(jobs.id, applicationId)).run();
+    tx.update(jobs)
+      .set(updates)
+      .where(and(eq(jobs.tenantId, tenantId), eq(jobs.id, applicationId)))
+      .run();
 
     return {
-      id: eventId,
-      applicationId,
-      title: parsedMetadata?.eventLabel ?? finalToStage,
-      groupId: parsedMetadata?.groupId ?? null,
-      fromStage,
-      toStage: finalToStage,
-      occurredAt: timestamp,
-      metadata: parsedMetadata,
-      outcome: outcome ?? null,
+      event: {
+        id: eventId,
+        applicationId,
+        title: parsedMetadata?.eventLabel ?? finalToStage,
+        groupId: parsedMetadata?.groupId ?? null,
+        fromStage,
+        toStage: finalToStage,
+        occurredAt: timestamp,
+        metadata: parsedMetadata,
+        outcome: outcome ?? null,
+      },
+      previousOutcome: (job.outcome as JobOutcome | null) ?? null,
     };
   });
 
-  maybeTrackStageAnalytics(event, parsedMetadata);
+  maybeTrackStageAnalytics(event, parsedMetadata, previousOutcome);
   return event;
 }
 
@@ -210,12 +240,15 @@ export function updateStageEvent(
     ? stageEventMetadataSchema.parse(metadata)
     : undefined;
   const hasOutcome = Object.hasOwn(payload, "outcome");
+  const tenantId = getActiveTenantId();
 
   db.transaction((tx) => {
     const event = tx
       .select()
       .from(stageEvents)
-      .where(eq(stageEvents.id, eventId))
+      .where(
+        and(eq(stageEvents.tenantId, tenantId), eq(stageEvents.id, eventId)),
+      )
       .get();
     if (!event) throw new Error("Event not found");
 
@@ -235,14 +268,21 @@ export function updateStageEvent(
 
     tx.update(stageEvents)
       .set(updates)
-      .where(eq(stageEvents.id, eventId))
+      .where(
+        and(eq(stageEvents.tenantId, tenantId), eq(stageEvents.id, eventId)),
+      )
       .run();
 
     // If this was the latest event, update the job status
     const lastEvent = tx
       .select()
       .from(stageEvents)
-      .where(eq(stageEvents.applicationId, event.applicationId))
+      .where(
+        and(
+          eq(stageEvents.tenantId, tenantId),
+          eq(stageEvents.applicationId, event.applicationId),
+        ),
+      )
       .orderBy(desc(stageEvents.occurredAt))
       .limit(1)
       .get();
@@ -251,7 +291,9 @@ export function updateStageEvent(
       const job = tx
         .select()
         .from(jobs)
-        .where(eq(jobs.id, event.applicationId))
+        .where(
+          and(eq(jobs.tenantId, tenantId), eq(jobs.id, event.applicationId)),
+        )
         .get();
       if (!job) throw new Error("Job not found");
 
@@ -273,28 +315,42 @@ export function updateStageEvent(
           closedAt,
           updatedAt: new Date().toISOString(),
         })
-        .where(eq(jobs.id, event.applicationId))
+        .where(
+          and(eq(jobs.tenantId, tenantId), eq(jobs.id, event.applicationId)),
+        )
         .run();
     }
   });
 }
 
 export function deleteStageEvent(eventId: string): void {
+  const tenantId = getActiveTenantId();
   db.transaction((tx) => {
     const event = tx
       .select()
       .from(stageEvents)
-      .where(eq(stageEvents.id, eventId))
+      .where(
+        and(eq(stageEvents.tenantId, tenantId), eq(stageEvents.id, eventId)),
+      )
       .get();
     if (!event) return;
 
-    tx.delete(stageEvents).where(eq(stageEvents.id, eventId)).run();
+    tx.delete(stageEvents)
+      .where(
+        and(eq(stageEvents.tenantId, tenantId), eq(stageEvents.id, eventId)),
+      )
+      .run();
 
     // Update job status based on the new latest event
     const lastEvent = tx
       .select()
       .from(stageEvents)
-      .where(eq(stageEvents.applicationId, event.applicationId))
+      .where(
+        and(
+          eq(stageEvents.tenantId, tenantId),
+          eq(stageEvents.applicationId, event.applicationId),
+        ),
+      )
       .orderBy(desc(stageEvents.occurredAt))
       .limit(1)
       .get();
@@ -303,7 +359,9 @@ export function deleteStageEvent(eventId: string): void {
       const job = tx
         .select()
         .from(jobs)
-        .where(eq(jobs.id, event.applicationId))
+        .where(
+          and(eq(jobs.tenantId, tenantId), eq(jobs.id, event.applicationId)),
+        )
         .get();
       if (!job) throw new Error("Job not found");
 
@@ -325,7 +383,9 @@ export function deleteStageEvent(eventId: string): void {
           closedAt,
           updatedAt: new Date().toISOString(),
         })
-        .where(eq(jobs.id, event.applicationId))
+        .where(
+          and(eq(jobs.tenantId, tenantId), eq(jobs.id, event.applicationId)),
+        )
         .run();
     } else {
       // If no events left, maybe revert to discovered?
@@ -338,7 +398,9 @@ export function deleteStageEvent(eventId: string): void {
           closedAt: null,
           updatedAt: new Date().toISOString(),
         })
-        .where(eq(jobs.id, event.applicationId))
+        .where(
+          and(eq(jobs.tenantId, tenantId), eq(jobs.id, event.applicationId)),
+        )
         .run();
     }
   });
@@ -384,14 +446,31 @@ function classifyStageAnalyticsSource(
 function maybeTrackStageAnalytics(
   event: StageEvent,
   metadata: StageEventMetadata | null,
+  previousOutcome: JobOutcome | null,
 ): void {
   const stageChanged = event.fromStage !== event.toStage;
   const isNoteEvent = metadata?.eventType === "note";
-  if (!stageChanged || isNoteEvent || event.toStage === "applied") {
+  if (!stageChanged || isNoteEvent) {
     return;
   }
 
   const source = classifyStageAnalyticsSource(metadata, event.toStage);
+  if (event.toStage === "applied") {
+    if (source !== "mark_applied") {
+      void trackCanonicalActivationEvent(
+        "application_marked_applied",
+        {
+          source,
+        },
+        {
+          occurredAt: event.occurredAt * 1000,
+          urlPath: "/applications/in-progress",
+        },
+      );
+    }
+    return;
+  }
+
   const enteredPositiveResponse =
     POSITIVE_RESPONSE_STAGES.has(event.toStage) &&
     (event.fromStage === null || event.fromStage === "applied");
@@ -410,34 +489,59 @@ function maybeTrackStageAnalytics(
   );
 
   if (enteredPositiveResponse) {
-    void trackServerProductEvent(
+    void trackCanonicalActivationEvent(
       "application_positive_response_detected",
       {
         stage: event.toStage,
         source,
       },
-      { urlPath: "/applications/in-progress" },
+      {
+        occurredAt: event.occurredAt * 1000,
+        urlPath: "/applications/in-progress",
+      },
     );
   }
 
   if (enteredInterview) {
-    void trackServerProductEvent(
+    void trackCanonicalActivationEvent(
       "application_interview_stage_reached",
       {
         stage: event.toStage,
         source,
       },
-      { urlPath: "/applications/in-progress" },
+      {
+        occurredAt: event.occurredAt * 1000,
+        urlPath: "/applications/in-progress",
+      },
     );
   }
 
   if (event.toStage === "offer") {
-    void trackServerProductEvent(
+    void trackCanonicalActivationEvent(
       "application_offer_detected",
       {
         source,
       },
-      { urlPath: "/applications/in-progress" },
+      {
+        occurredAt: event.occurredAt * 1000,
+        urlPath: "/applications/in-progress",
+      },
+    );
+  }
+
+  if (
+    previousOutcome !== "offer_accepted" &&
+    (event.outcome === "offer_accepted" || event.toStage === "offer")
+  ) {
+    void trackCanonicalActivationEvent(
+      "application_accepted",
+      {
+        source,
+      },
+      {
+        occurredAt: event.occurredAt * 1000,
+        urlPath: "/applications/in-progress",
+      },
     );
   }
 }

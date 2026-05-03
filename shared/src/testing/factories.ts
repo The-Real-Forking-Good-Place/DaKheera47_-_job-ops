@@ -23,6 +23,8 @@ export const createJob = (overrides: Partial<Job> = {}): Job => ({
   deadline: null,
   salary: null,
   location: "California",
+  locationEvidence: null,
+  locationMatch: null,
   degreeRequired: null,
   starting: null,
   jobDescription: "Job description content",
@@ -161,6 +163,8 @@ export const createAppSettings = (
   adzunaMaxJobsPerTerm: { value: 50, default: 50, override: null },
   gradcrackerMaxJobsPerTerm: { value: 50, default: 50, override: null },
   startupjobsMaxJobsPerTerm: { value: 50, default: 50, override: null },
+  seekMaxJobsPerTerm: { value: 50, default: 50, override: null },
+  naukriMaxJobsPerTerm: { value: 50, default: 50, override: null },
   searchTerms: {
     value: ["Software Engineer"],
     default: ["Software Engineer"],
@@ -184,6 +188,11 @@ export const createAppSettings = (
   ghostwriterSystemPromptTemplate: {
     value: getDefaultPromptTemplate("ghostwriterSystemPromptTemplate"),
     default: getDefaultPromptTemplate("ghostwriterSystemPromptTemplate"),
+    override: null,
+  },
+  ghostwriterStopSlopEnabled: {
+    value: false,
+    default: false,
     override: null,
   },
   tailoringPromptTemplate: {
@@ -253,6 +262,7 @@ export const createAppSettings = (
   ukvisajobsPasswordHint: null,
   adzunaAppId: null,
   adzunaAppKeyHint: null,
+  apifyTokenHint: null,
   webhookSecretHint: null,
   basicAuthActive: false,
   backupEnabled: { value: false, default: false, override: null },

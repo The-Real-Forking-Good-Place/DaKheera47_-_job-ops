@@ -4,30 +4,30 @@ import { getExtractorRegistry } from "@server/extractors/registry";
 import { getAllJobUrls } from "@server/repositories/jobs";
 import * as settingsRepo from "@server/repositories/settings";
 import { asyncPool } from "@server/utils/async-pool";
+import type { ExtractorSourceId } from "@shared/extractors";
+import { matchJobLocationIntent } from "@shared/job-matching.js";
 import {
-  normalizeLocationMatchStrictness,
-  normalizeLocationSearchScope,
-} from "@shared/location-preferences.js";
-import {
-  formatCountryLabel,
-  isSourceAllowedForCountry,
-  normalizeCountryKey,
-} from "@shared/location-support.js";
+  buildLocationEvidence as buildSharedLocationEvidence,
+  createLocationIntentFromLegacyInputs,
+  getPrimaryLocationLabel,
+  planLocationSource,
+} from "@shared/location-domain.js";
+import { formatCountryLabel } from "@shared/location-support.js";
 import { normalizeStringArray } from "@shared/normalize-string-array.js";
-import {
-  matchesRequestedCity,
-  matchesRequestedCountry,
-  resolveSearchCities,
-  shouldApplyStrictCityFilter,
-} from "@shared/search-cities.js";
 import type { CreateJobInput, PipelineConfig } from "@shared/types";
-import { type CrawlSource, progressHelpers, updateProgress } from "../progress";
+import {
+  type CrawlSource,
+  type PendingChallenge,
+  progressHelpers,
+  updateProgress,
+} from "../progress";
 
 const DISCOVERY_CONCURRENCY = 3;
 
 type DiscoveryTaskResult = {
   discoveredJobs: CreateJobInput[];
   sourceErrors: string[];
+  challenge?: PendingChallenge;
 };
 
 type DiscoverySourceTask = {
@@ -50,18 +50,6 @@ function parseBlockedCompanyKeywords(raw: string | undefined): string[] {
   }
 }
 
-function isBlockedEmployer(
-  employer: string | null | undefined,
-  blockedKeywordsLowerCase: string[],
-): boolean {
-  if (!employer) return false;
-  if (blockedKeywordsLowerCase.length === 0) return false;
-  const normalizedEmployer = employer.toLowerCase();
-  return blockedKeywordsLowerCase.some((keyword) =>
-    normalizedEmployer.includes(keyword),
-  );
-}
-
 function parseWorkplaceTypes(
   raw: string | undefined,
 ): Array<"remote" | "hybrid" | "onsite"> {
@@ -78,74 +66,51 @@ function parseWorkplaceTypes(
   }
 }
 
-function matchesSelectedLocations(args: {
-  job: CreateJobInput;
-  selectedCountry: string;
-  requestedCities: string[];
-  matchStrictness: "exact_only" | "flexible";
-}): boolean {
-  const { job, selectedCountry, requestedCities, matchStrictness } = args;
-  if (!selectedCountry) return true;
-
-  const countryMatches = matchesRequestedCountry(
-    job.location ?? undefined,
-    selectedCountry,
+function isBlockedEmployer(
+  employer: string | null | undefined,
+  blockedKeywordsLowerCase: string[],
+): boolean {
+  if (!employer) return false;
+  if (blockedKeywordsLowerCase.length === 0) return false;
+  const normalizedEmployer = employer.toLowerCase();
+  return blockedKeywordsLowerCase.some((keyword) =>
+    normalizedEmployer.includes(keyword),
   );
-  if (!countryMatches) return false;
-  if (requestedCities.length === 0) return true;
-
-  const cityMatches = requestedCities.some((requestedCity) => {
-    const strict = shouldApplyStrictCityFilter(requestedCity, selectedCountry);
-    if (!strict) return true;
-    return matchesRequestedCity(job.location, requestedCity);
-  });
-
-  if (cityMatches) return true;
-  return matchStrictness === "flexible";
 }
 
-function filterJobsByLocationPreferences(args: {
-  jobs: CreateJobInput[];
-  selectedCountry: string;
-  requestedCities: string[];
-  workplaceTypes: Array<"remote" | "hybrid" | "onsite">;
-  searchScope:
-    | "selected_only"
-    | "selected_plus_remote_worldwide"
-    | "remote_worldwide_prioritize_selected";
-  matchStrictness: "exact_only" | "flexible";
-}): CreateJobInput[] {
-  const {
-    jobs,
-    selectedCountry,
-    requestedCities,
-    workplaceTypes,
-    searchScope,
-    matchStrictness,
-  } = args;
+function getLegacyLocationSelection(
+  intent: NonNullable<PipelineConfig["locationIntent"]>,
+): string {
+  return intent.selectedCountry ?? "";
+}
 
-  if (!selectedCountry) return jobs;
+function getSourceLocationPlan(
+  source: CrawlSource,
+  intent: NonNullable<PipelineConfig["locationIntent"]>,
+): ReturnType<typeof planLocationSource> & {
+  canRun: boolean;
+  warnings: string[];
+} {
+  const plan = planLocationSource({ source, intent });
+  return {
+    ...plan,
+    canRun: plan.isCompatible,
+    warnings: plan.reasons,
+  };
+}
 
-  const allowRemoteWorldwide =
-    workplaceTypes.includes("remote") && searchScope !== "selected_only";
-
-  return jobs.filter((job) => {
-    if (
-      matchesSelectedLocations({
-        job,
-        selectedCountry,
-        requestedCities,
-        matchStrictness,
-      })
-    ) {
-      return true;
-    }
-
-    if (allowRemoteWorldwide && job.isRemote) {
-      return true;
-    }
-
-    return false;
+function buildLocationEvidence(args: {
+  location?: string | null;
+  isRemote?: boolean | null;
+  sourceNotes?: readonly string[] | null;
+}): CreateJobInput["locationEvidence"] {
+  if (!args.location && args.isRemote !== true) return undefined;
+  return buildSharedLocationEvidence({
+    location: args.location ?? (args.isRemote ? "Remote" : null),
+    isRemote: args.isRemote ?? null,
+    source:
+      args.sourceNotes?.find((note) => note.startsWith("source:"))?.slice(7) ??
+      null,
   });
 }
 
@@ -155,6 +120,7 @@ export async function discoverJobsStep(args: {
 }): Promise<{
   discoveredJobs: CreateJobInput[];
   sourceErrors: string[];
+  pendingChallenges: PendingChallenge[];
 }> {
   logger.info("Running discovery step");
 
@@ -178,21 +144,22 @@ export async function discoverJobsStep(args: {
       .filter(Boolean);
   }
 
-  const selectedCountry = normalizeCountryKey(
-    settings.jobspyCountryIndeed ?? "",
-  );
-  const workplaceTypes = parseWorkplaceTypes(settings.workplaceTypes);
-  const searchScope = normalizeLocationSearchScope(
-    settings.locationSearchScope,
-  );
-  const matchStrictness = normalizeLocationMatchStrictness(
-    settings.locationMatchStrictness,
-  );
-  const compatibleSources = selectedCountry
-    ? args.mergedConfig.sources.filter((source) =>
-        isSourceAllowedForCountry(source, selectedCountry),
-      )
-    : args.mergedConfig.sources;
+  const locationIntent =
+    args.mergedConfig.locationIntent ??
+    createLocationIntentFromLegacyInputs({
+      selectedCountry: settings.jobspyCountryIndeed ?? "",
+      searchCities: settings.searchCities ?? settings.jobspyLocation ?? "",
+      workplaceTypes: parseWorkplaceTypes(settings.workplaceTypes),
+      searchScope: settings.locationSearchScope,
+      matchStrictness: settings.locationMatchStrictness,
+    });
+  const sourcePlans = args.mergedConfig.sources.map((source) => ({
+    source,
+    plan: getSourceLocationPlan(source, locationIntent),
+  }));
+  const compatibleSources = sourcePlans
+    .filter(({ plan }) => plan.canRun)
+    .map(({ source }) => source);
   let existingJobUrlsPromise: Promise<string[]> | null = null;
   const getExistingJobUrls = (): Promise<string[]> => {
     if (!existingJobUrlsPromise) {
@@ -200,27 +167,24 @@ export async function discoverJobsStep(args: {
     }
     return existingJobUrlsPromise;
   };
-  const skippedSources = args.mergedConfig.sources.filter(
-    (source) => !compatibleSources.includes(source),
-  );
+  const skippedSources = sourcePlans.filter(({ plan }) => !plan.canRun);
 
-  if (selectedCountry && skippedSources.length > 0) {
-    logger.info("Skipping incompatible sources for selected country", {
+  if (skippedSources.length > 0) {
+    logger.info("Skipping incompatible sources for requested location intent", {
       step: "discover-jobs",
-      country: selectedCountry,
-      countryLabel: formatCountryLabel(selectedCountry),
+      locationIntent,
+      primaryLocation: getPrimaryLocationLabel(locationIntent),
       requestedSources: args.mergedConfig.sources,
-      skippedSources,
+      skippedSources: skippedSources.map(({ source }) => source),
+      warnings: skippedSources.flatMap(({ plan }) => plan.warnings),
     });
   }
 
-  if (
-    selectedCountry &&
-    args.mergedConfig.sources.length > 0 &&
-    compatibleSources.length === 0
-  ) {
+  if (args.mergedConfig.sources.length > 0 && compatibleSources.length === 0) {
     throw new Error(
-      `No compatible sources for selected country: ${formatCountryLabel(selectedCountry)}`,
+      locationIntent.selectedCountry
+        ? `No compatible sources for selected country: ${formatCountryLabel(locationIntent.selectedCountry)}`
+        : `No compatible sources for requested location: ${getPrimaryLocationLabel(locationIntent)}`,
     );
   }
 
@@ -275,7 +239,12 @@ export async function discoverJobsStep(args: {
           selectedSources: grouped.sources,
           settings: filteredSettings,
           searchTerms,
-          selectedCountry,
+          selectedCountry: getLegacyLocationSelection(locationIntent),
+          locationIntent,
+          sourceLocationPlan: getSourceLocationPlan(
+            grouped.sources[0] as CrawlSource,
+            locationIntent,
+          ),
           getExistingJobUrls,
           shouldCancel: args.shouldCancel,
           onProgress: (event) => {
@@ -308,6 +277,14 @@ export async function discoverJobsStep(args: {
             sourceErrors: [
               `${manifest.displayName || manifest.id}: ${result.error ?? "unknown error"} (sources: ${grouped.sources.join(",")})`,
             ],
+            challenge: result.challengeRequired
+              ? {
+                  extractorId: manifest.id,
+                  extractorName: manifest.displayName || manifest.id,
+                  url: result.challengeRequired,
+                  sources: grouped.sources as ExtractorSourceId[],
+                }
+              : undefined,
           };
         }
 
@@ -325,7 +302,7 @@ export async function discoverJobsStep(args: {
   progressHelpers.startCrawling(totalSources);
 
   if (args.shouldCancel?.()) {
-    return { discoveredJobs, sourceErrors };
+    return { discoveredJobs, sourceErrors, pendingChallenges: [] };
   }
 
   const sourceResults = await asyncPool({
@@ -366,21 +343,36 @@ export async function discoverJobsStep(args: {
     },
   });
 
+  // Collect challenges after ALL extractors finish, not on first failure.
+  // This way the user sees every challenged site at once and can solve them
+  // in a single batch, rather than solve-one → re-run → hit-next → solve-again.
+  const pendingChallenges: PendingChallenge[] = [];
   for (const sourceResult of sourceResults) {
     discoveredJobs.push(...sourceResult.discoveredJobs);
     sourceErrors.push(...sourceResult.sourceErrors);
+    if (sourceResult.challenge) {
+      pendingChallenges.push(sourceResult.challenge);
+    }
   }
 
-  const requestedCities = resolveSearchCities({
-    single: settings.searchCities ?? settings.jobspyLocation,
-  });
-  const locationFilteredJobs = filterJobsByLocationPreferences({
-    jobs: discoveredJobs,
-    selectedCountry,
-    requestedCities,
-    workplaceTypes,
-    searchScope,
-    matchStrictness,
+  const locationFilterReasonCounts: Record<string, number> = {};
+  const locationFilteredJobs = discoveredJobs.filter((job) => {
+    const evidence =
+      job.locationEvidence ??
+      buildLocationEvidence({
+        location: job.location,
+        isRemote: job.isRemote,
+        sourceNotes: [`source:${job.source}`],
+      });
+    job.locationEvidence = evidence;
+    const match = matchJobLocationIntent(job, locationIntent);
+    if (match.matched) {
+      return true;
+    }
+    const reasonCode = match.reasonCode;
+    locationFilterReasonCounts[reasonCode] =
+      (locationFilterReasonCounts[reasonCode] ?? 0) + 1;
+    return false;
   });
   const locationFilteredOutCount =
     discoveredJobs.length - locationFilteredJobs.length;
@@ -391,12 +383,9 @@ export async function discoverJobsStep(args: {
       {
         step: "discover-jobs",
         droppedCount: locationFilteredOutCount,
-        selectedCountry,
-        requestedCities,
-        searchScope,
-        matchStrictness,
-        allowRemoteWorldwide:
-          workplaceTypes.includes("remote") && searchScope !== "selected_only",
+        locationIntent,
+        primaryLocation: getPrimaryLocationLabel(locationIntent),
+        reasonCounts: locationFilterReasonCounts,
       },
     );
   }
@@ -433,18 +422,44 @@ export async function discoverJobsStep(args: {
   }
 
   if (args.shouldCancel?.()) {
-    return { discoveredJobs: filteredDiscoveredJobs, sourceErrors };
+    return {
+      discoveredJobs: filteredDiscoveredJobs,
+      sourceErrors,
+      pendingChallenges,
+    };
   }
 
-  if (filteredDiscoveredJobs.length === 0 && sourceErrors.length > 0) {
+  // Don't throw "all sources failed" when challenges are pending — the
+  // orchestrator will pause, let the user solve them, then re-run those
+  // extractors.  Jobs from non-challenged extractors (if any) are kept.
+  if (
+    filteredDiscoveredJobs.length === 0 &&
+    sourceErrors.length > 0 &&
+    pendingChallenges.length === 0
+  ) {
     throw new Error(`All sources failed: ${sourceErrors.join("; ")}`);
   }
 
   if (sourceErrors.length > 0) {
-    logger.warn("Some discovery sources failed", { sourceErrors });
+    if (pendingChallenges.length > 0) {
+      logger.info("Some discovery sources hit challenges and will be retried", {
+        sourceErrors,
+        pendingChallenges,
+      });
+    } else {
+      logger.warn("Some discovery sources failed", { sourceErrors });
+    }
   }
 
-  progressHelpers.crawlingComplete(filteredDiscoveredJobs.length);
+  // Don't transition to "importing" yet if there are challenges to solve —
+  // the orchestrator will pause and re-run after challenges are resolved.
+  if (pendingChallenges.length === 0) {
+    progressHelpers.crawlingComplete(filteredDiscoveredJobs.length);
+  }
 
-  return { discoveredJobs: filteredDiscoveredJobs, sourceErrors };
+  return {
+    discoveredJobs: filteredDiscoveredJobs,
+    sourceErrors,
+    pendingChallenges,
+  };
 }

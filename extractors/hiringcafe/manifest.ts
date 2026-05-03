@@ -51,6 +51,7 @@ export const manifest: ExtractorManifest = {
   id: "hiringcafe",
   displayName: "Hiring Cafe",
   providesSources: ["hiringcafe"],
+  capabilities: { locationEvidence: true },
   async run(context) {
     if (context.shouldCancel?.()) {
       return { success: true, jobs: [] };
@@ -84,6 +85,7 @@ export const manifest: ExtractorManifest = {
         success: false,
         jobs: [],
         error: result.error,
+        challengeRequired: result.challengeRequired,
       };
     }
 

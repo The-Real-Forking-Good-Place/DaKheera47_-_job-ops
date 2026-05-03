@@ -5,14 +5,19 @@
 
 import { existsSync } from "node:fs";
 import { access, mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import { notFound } from "@infra/errors";
+import { AppError, type AppErrorCode, notFound } from "@infra/errors";
 import { logger } from "@infra/logger";
 import { getSetting } from "@server/repositories/settings";
 import { settingsRegistry } from "@shared/settings-registry";
 import type { DesignResumePdfResponse, PdfRenderer } from "@shared/types";
-import { getDataDir } from "../config/dataDir";
 import { getCurrentDesignResume } from "./design-resume";
+import { resolveWritingOutputLanguageForResumeJson } from "./output-language";
+import {
+  getLegacyJobPdfPath,
+  getTenantDesignResumePdfPath,
+  getTenantJobPdfPath,
+  getTenantPdfDir,
+} from "./pdf-storage";
 import { renderResumePdf } from "./resume-renderer";
 import {
   deleteResume as deleteRxResume,
@@ -28,13 +33,13 @@ import {
   prepareReactiveResumeV5DocumentForExternalUse,
 } from "./rxresume/document";
 import { parseV5ResumeData } from "./rxresume/schema/v5";
-
-const OUTPUT_DIR = join(getDataDir(), "pdfs");
+import { getWritingStyle } from "./writing-style";
 
 export interface PdfResult {
   success: boolean;
   pdfPath?: string;
   error?: string;
+  errorCode?: AppErrorCode;
 }
 
 export interface TailoredPdfContent {
@@ -50,8 +55,9 @@ export interface GeneratePdfOptions {
 }
 
 async function ensureOutputDir(): Promise<void> {
-  if (!existsSync(OUTPUT_DIR)) {
-    await mkdir(OUTPUT_DIR, { recursive: true });
+  const outputDir = getTenantPdfDir();
+  if (!existsSync(outputDir)) {
+    await mkdir(outputDir, { recursive: true });
   }
 }
 
@@ -70,6 +76,14 @@ async function resolvePdfRenderer(): Promise<PdfRenderer> {
     settingsRegistry.pdfRenderer.parse(storedValue ?? undefined) ??
     settingsRegistry.pdfRenderer.default()
   );
+}
+
+async function resolveLatexResumeLanguage(resumeJson: Record<string, unknown>) {
+  const writingStyle = await getWritingStyle();
+  return resolveWritingOutputLanguageForResumeJson({
+    style: writingStyle,
+    resumeJson,
+  }).language;
 }
 
 async function downloadRxResumePdf(
@@ -129,6 +143,25 @@ async function renderRxResumePdf(args: {
       }
     }
   }
+}
+
+function classifyPdfGenerationError(error: unknown): AppErrorCode {
+  if (error instanceof AppError) {
+    return error.code;
+  }
+
+  if (
+    error instanceof Error &&
+    /Reactive Resume|RxResume/i.test(error.message)
+  ) {
+    return "UPSTREAM_ERROR";
+  }
+
+  if (error instanceof Error && error.name === "AbortError") {
+    return "REQUEST_TIMEOUT";
+  }
+
+  return "INTERNAL_ERROR";
 }
 
 async function resolveDesignResumeForRenderer(args: {
@@ -301,12 +334,14 @@ export async function generatePdf(
       throw err;
     }
 
-    const outputPath = join(OUTPUT_DIR, `resume_${jobId}.pdf`);
+    const outputPath = getTenantJobPdfPath(jobId);
     if (renderer === "latex") {
+      const language = await resolveLatexResumeLanguage(preparedResume.data);
       await renderResumePdf({
         resumeJson: preparedResume.data,
         outputPath,
         jobId,
+        language,
       });
     } else {
       await renderRxResumePdf({
@@ -322,7 +357,11 @@ export async function generatePdf(
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     logger.error("PDF generation failed", { jobId, renderer, error });
-    return { success: false, error: message };
+    return {
+      success: false,
+      error: message,
+      errorCode: classifyPdfGenerationError(error),
+    };
   }
 }
 
@@ -335,8 +374,7 @@ export async function generateDesignResumePdf(options?: {
     requestOrigin: options?.requestOrigin ?? null,
   });
   const generatedAt = new Date().toISOString();
-  const outputFileName = "design_resume_current.pdf";
-  const outputPath = join(OUTPUT_DIR, outputFileName);
+  const outputPath = getTenantDesignResumePdfPath();
   const preparedResume: PreparedRxResumePdfPayload = {
     mode: "v5",
     data: structuredClone(designResume.data) as Record<string, unknown>,
@@ -352,10 +390,12 @@ export async function generateDesignResumePdf(options?: {
   });
 
   if (renderer === "latex") {
+    const language = await resolveLatexResumeLanguage(designResume.data);
     await renderResumePdf({
       resumeJson: designResume.data,
       outputPath,
       jobId: "design-resume",
+      language,
     });
   } else {
     await renderRxResumePdf({
@@ -369,7 +409,7 @@ export async function generateDesignResumePdf(options?: {
 
   return {
     fileName: sanitizePdfFileName(designResume.title),
-    pdfUrl: `/pdfs/${outputFileName}?v=${encodeURIComponent(generatedAt)}`,
+    pdfUrl: `/api/design-resume/pdf?v=${encodeURIComponent(generatedAt)}`,
     generatedAt,
   };
 }
@@ -378,12 +418,17 @@ export async function generateDesignResumePdf(options?: {
  * Check if a PDF exists for a job.
  */
 export async function pdfExists(jobId: string): Promise<boolean> {
-  const pdfPath = join(OUTPUT_DIR, `resume_${jobId}.pdf`);
+  const pdfPath = getTenantJobPdfPath(jobId);
   try {
     await access(pdfPath);
     return true;
   } catch {
-    return false;
+    try {
+      await access(getLegacyJobPdfPath(jobId));
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
 
@@ -391,5 +436,7 @@ export async function pdfExists(jobId: string): Promise<boolean> {
  * Get the path to a job's PDF.
  */
 export function getPdfPath(jobId: string): string {
-  return join(OUTPUT_DIR, `resume_${jobId}.pdf`);
+  const pdfPath = getTenantJobPdfPath(jobId);
+  if (existsSync(pdfPath)) return pdfPath;
+  return getLegacyJobPdfPath(jobId);
 }

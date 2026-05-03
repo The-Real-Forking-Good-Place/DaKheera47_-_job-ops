@@ -1,6 +1,6 @@
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import type { Server } from "node:http";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { startServer, stopServer } from "./test-utils";
 
@@ -11,6 +11,7 @@ describe.sequential("Jobs API routes", () => {
   let tempDir: string;
 
   beforeEach(async () => {
+    vi.clearAllMocks();
     ({ server, baseUrl, closeDb, tempDir } = await startServer());
   });
 
@@ -185,10 +186,16 @@ describe.sequential("Jobs API routes", () => {
       jobUrl: "https://example.com/job/reposted",
       jobDescription: "Reposted description",
     });
+    const repostedDiscoveredAtMs = Date.parse(repostedJob.discoveredAt);
+    const appliedAt = new Date(
+      Number.isFinite(repostedDiscoveredAtMs)
+        ? repostedDiscoveredAtMs - 24 * 60 * 60 * 1000
+        : Date.now() - 24 * 60 * 60 * 1000,
+    ).toISOString();
 
     await updateJob(appliedJob.id, {
       status: "applied",
-      appliedAt: "2026-04-01T10:00:00.000Z",
+      appliedAt,
     });
     await updateJob(repostedJob.id, { status: "ready" });
 
@@ -623,7 +630,12 @@ describe.sequential("Jobs API routes", () => {
       }),
     });
     const body = await res.json();
-    const storedPath = join(tempDir, "pdfs", `resume_${job.id}.pdf`);
+    const storedPath = join(
+      tempDir,
+      "pdfs",
+      "tenant_default",
+      `resume_${job.id}.pdf`,
+    );
 
     expect(res.status).toBe(201);
     expect(body.ok).toBe(true);
@@ -660,6 +672,31 @@ describe.sequential("Jobs API routes", () => {
     expect(body.error.code).toBe("INVALID_REQUEST");
     expect(body.error.message).toMatch(/valid pdf/i);
     expect(typeof body.meta.requestId).toBe("string");
+  });
+
+  it("serves legacy job PDFs when pdfPath is not set", async () => {
+    const { createJob } = await import("@server/repositories/jobs");
+    const { getLegacyJobPdfPath } = await import(
+      "@server/services/pdf-storage"
+    );
+    const job = await createJob({
+      source: "manual",
+      title: "Legacy PDF Role",
+      employer: "Acme",
+      jobUrl: "https://example.com/job/legacy-pdf-role",
+      jobDescription: "Legacy PDF fallback coverage",
+    });
+
+    const legacyPdfPath = getLegacyJobPdfPath(job.id);
+    await mkdir(dirname(legacyPdfPath), { recursive: true });
+    await writeFile(legacyPdfPath, Buffer.from("%PDF-1.7\nLegacy resume\n"));
+
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/pdf`);
+    const content = Buffer.from(await res.arrayBuffer()).toString("utf8");
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toContain("private");
+    expect(content).toContain("Legacy resume");
   });
 
   it("updates core job detail fields", async () => {
@@ -852,6 +889,38 @@ describe.sequential("Jobs API routes", () => {
         process.env.JOBOPS_PUBLIC_BASE_URL = previousBaseUrl;
       }
     }
+  });
+
+  it("returns an upstream error when Reactive Resume PDF generation fails", async () => {
+    const { createJob } = await import("@server/repositories/jobs");
+    const { generateFinalPdf } = await import("@server/pipeline/index");
+    const job = await createJob({
+      source: "manual",
+      title: "PDF Failure Test",
+      employer: "Example Co",
+      jobUrl: "https://example.com/job/pdf-failure-test",
+      jobDescription: "Test description",
+    });
+
+    vi.mocked(generateFinalPdf).mockResolvedValueOnce({
+      success: false,
+      error:
+        "PDF generation failed. Your previous resume PDF is still available. Reactive Resume API error (500): Failed to generate PDF",
+      errorCode: "UPSTREAM_ERROR",
+    });
+
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/generate-pdf`, {
+      method: "POST",
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(502);
+    expect(body.ok).toBe(false);
+    expect(body.error.code).toBe("UPSTREAM_ERROR");
+    expect(body.error.message).toContain(
+      "Your previous resume PDF is still available",
+    );
+    expect(typeof body.meta.requestId).toBe("string");
   });
 
   it("returns 409 when patching to a duplicate job URL", async () => {
@@ -1261,6 +1330,9 @@ describe.sequential("Jobs API routes", () => {
 
   it("applies a job", async () => {
     const { createJob } = await import("@server/repositories/jobs");
+    const { trackCanonicalActivationEvent } = await import(
+      "@server/services/activation-funnel"
+    );
     const job = await createJob({
       source: "manual",
       title: "Test Role",
@@ -1276,6 +1348,15 @@ describe.sequential("Jobs API routes", () => {
     expect(body.ok).toBe(true);
     expect(body.data.status).toBe("applied");
     expect(body.data.appliedAt).toBeTruthy();
+    expect(trackCanonicalActivationEvent).toHaveBeenCalledWith(
+      "application_marked_applied",
+      expect.objectContaining({
+        source: "jobs_apply_route",
+      }),
+      expect.objectContaining({
+        urlPath: "/jobs",
+      }),
+    );
   });
 
   it("rescoring a job updates the suitability fields", async () => {
@@ -1461,6 +1542,9 @@ describe.sequential("Jobs API routes", () => {
     });
 
     it("transitions stages and retrieves events", async () => {
+      const { trackCanonicalActivationEvent } = await import(
+        "@server/services/activation-funnel"
+      );
       // 1. Initial transition to applied
       const trans1 = await fetch(`${baseUrl}/api/jobs/${jobId}/stages`, {
         method: "POST",
@@ -1471,6 +1555,15 @@ describe.sequential("Jobs API routes", () => {
       expect(body1.ok).toBe(true);
       expect(body1.data.toStage).toBe("applied");
       const eventId = body1.data.id;
+      expect(trackCanonicalActivationEvent).toHaveBeenCalledWith(
+        "application_marked_applied",
+        {
+          source: "system",
+        },
+        expect.objectContaining({
+          occurredAt: body1.data.occurredAt * 1000,
+        }),
+      );
 
       // 2. Transition to recruiter_screen with metadata
       await fetch(`${baseUrl}/api/jobs/${jobId}/stages`, {
@@ -1490,6 +1583,15 @@ describe.sequential("Jobs API routes", () => {
       expect(eventsBody.data[0].toStage).toBe("applied");
       expect(eventsBody.data[1].toStage).toBe("recruiter_screen");
       expect(eventsBody.data[1].metadata.note).toBe("Called by recruiter");
+      expect(trackCanonicalActivationEvent).toHaveBeenCalledWith(
+        "application_positive_response_detected",
+        expect.objectContaining({
+          stage: "recruiter_screen",
+        }),
+        expect.objectContaining({
+          occurredAt: eventsBody.data[1].occurredAt * 1000,
+        }),
+      );
 
       // 4. Patch an event
       const patchRes = await fetch(
@@ -1518,6 +1620,40 @@ describe.sequential("Jobs API routes", () => {
       const eventsRes3 = await fetch(`${baseUrl}/api/jobs/${jobId}/events`);
       const eventsBody3 = await eventsRes3.json();
       expect(eventsBody3.data).toHaveLength(1);
+    });
+
+    it("tracks offer stages as offer and acceptance backend events", async () => {
+      const { trackCanonicalActivationEvent } = await import(
+        "@server/services/activation-funnel"
+      );
+
+      const res = await fetch(`${baseUrl}/api/jobs/${jobId}/stages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ toStage: "offer", occurredAt: 1_713_456_700 }),
+      });
+      const body = await res.json();
+
+      expect(res.status).toBe(200);
+      expect(body.ok).toBe(true);
+      expect(trackCanonicalActivationEvent).toHaveBeenCalledWith(
+        "application_offer_detected",
+        {
+          source: "system",
+        },
+        expect.objectContaining({
+          occurredAt: 1_713_456_700_000,
+        }),
+      );
+      expect(trackCanonicalActivationEvent).toHaveBeenCalledWith(
+        "application_accepted",
+        {
+          source: "system",
+        },
+        expect.objectContaining({
+          occurredAt: 1_713_456_700_000,
+        }),
+      );
     });
 
     it("manages application tasks", async () => {
@@ -1567,6 +1703,9 @@ describe.sequential("Jobs API routes", () => {
     });
 
     it("updates job outcome", async () => {
+      const { trackCanonicalActivationEvent } = await import(
+        "@server/services/activation-funnel"
+      );
       const res = await fetch(`${baseUrl}/api/jobs/${jobId}/outcome`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -1576,6 +1715,41 @@ describe.sequential("Jobs API routes", () => {
       expect(body.ok).toBe(true);
       expect(body.data.outcome).toBe("rejected");
       expect(body.data.closedAt).toBeTruthy();
+      expect(trackCanonicalActivationEvent).not.toHaveBeenCalledWith(
+        "application_accepted",
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it("tracks accepted outcomes as a canonical backend event", async () => {
+      const { trackCanonicalActivationEvent } = await import(
+        "@server/services/activation-funnel"
+      );
+
+      const res = await fetch(`${baseUrl}/api/jobs/${jobId}/outcome`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          outcome: "offer_accepted",
+          closedAt: 1_713_456_789,
+        }),
+      });
+      const body = await res.json();
+
+      expect(res.status).toBe(200);
+      expect(body.ok).toBe(true);
+      expect(body.data.outcome).toBe("offer_accepted");
+      expect(trackCanonicalActivationEvent).toHaveBeenCalledWith(
+        "application_accepted",
+        {
+          source: "jobs_outcome_route",
+        },
+        expect.objectContaining({
+          occurredAt: 1_713_456_789_000,
+          urlPath: "/applications/in-progress",
+        }),
+      );
     });
   });
 });

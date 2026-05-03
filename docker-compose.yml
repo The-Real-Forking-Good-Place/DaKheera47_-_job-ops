@@ -7,6 +7,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      secrets:
+        - github_token
     image: ghcr.io/dakheera47/job-ops:latest
     container_name: job-ops
     ports:
@@ -29,13 +31,6 @@ services:
     env_file:
       - path: ./.env
         required: false
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
     develop:
       watch:
         # Rebuild container when package.json changes
@@ -66,9 +61,26 @@ services:
         - path: ./extractors/golangjobs/src
           target: /app/extractors/golangjobs/src
           action: sync+restart
+        - path: ./extractors/seek/src
+          target: /app/extractors/seek/src
+          action: sync+restart
         - path: ./extractors/jobspy
           target: /app/extractors/jobspy
           action: sync+restart
+        - path: ./extractors/naukri
+          target: /app/extractors/naukri
+          action: sync+restart
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+secrets:
+  github_token:
+    environment: GITHUB_TOKEN
 
 # Volumes for data persistence
 volumes:

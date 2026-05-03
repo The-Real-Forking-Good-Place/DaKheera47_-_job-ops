@@ -19,11 +19,15 @@ describe.sequential("Jobs tailoring PATCH route", () => {
   async function createManualJobId(): Promise<string> {
     const response = await fetch(`${baseUrl}/api/manual-jobs/import`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Connection: "close",
+      },
       body: JSON.stringify({
         job: {
           title: "Backend Engineer",
           employer: "Acme",
+          jobUrl: "https://example.com/jobs/backend-engineer",
           jobDescription: "Build backend systems",
         },
       }),
@@ -51,7 +55,10 @@ describe.sequential("Jobs tailoring PATCH route", () => {
 
     const response = await fetch(`${baseUrl}/api/jobs/${jobId}`, {
       method: "PATCH",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Connection: "close",
+      },
       body: JSON.stringify({
         tailoredHeadline: "Senior Backend Engineer",
         tailoredSkills: skills,
@@ -73,7 +80,10 @@ describe.sequential("Jobs tailoring PATCH route", () => {
 
     const response = await fetch(`${baseUrl}/api/jobs/${jobId}`, {
       method: "PATCH",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Connection: "close",
+      },
       body: JSON.stringify({
         tailoredHeadline: "Senior Backend Engineer",
         tailoredSkills: '{"name":"Backend","keywords":["TypeScript"]}',

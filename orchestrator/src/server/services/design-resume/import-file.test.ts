@@ -1,5 +1,6 @@
 import { AppError } from "@infra/errors";
 import type { DesignResumeDocument, DesignResumeJson } from "@shared/types";
+import JSZip from "jszip";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { buildDefaultReactiveResumeDocument } from "../rxresume/document";
 
@@ -37,6 +38,34 @@ function makeResumeDocument(
     updatedAt: "2026-04-11T00:00:00.000Z",
     assets: [],
   };
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+async function makeDocxBase64(text: string): Promise<string> {
+  const zip = new JSZip();
+  zip.file(
+    "word/document.xml",
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:r>
+        <w:t>${escapeXml(text)}</w:t>
+      </w:r>
+    </w:p>
+  </w:body>
+</w:document>`,
+  );
+  const buffer = await zip.generateAsync({ type: "nodebuffer" });
+  return buffer.toString("base64");
 }
 
 describe("importDesignResumeFromFile", () => {
@@ -126,6 +155,166 @@ describe("importDesignResumeFromFile", () => {
     expect(result.title).toBe("Taylor Resume");
   });
 
+  it("extracts DOCX text locally before sending it to Gemini", async () => {
+    modelSelection.resolveLlmRuntimeSettings.mockResolvedValueOnce({
+      provider: "gemini",
+      model: "google/gemini-3-flash-preview",
+      baseUrl: null,
+      apiKey: "gemini-test",
+    });
+
+    const docxBase64 = await makeDocxBase64("Taylor Quinn\nSenior Engineer");
+
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [{ text: '{"basics":{"name":"Taylor Quinn"}}' }],
+              },
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+
+    await importDesignResumeFromFile({
+      fileName: "resume.docx",
+      mediaType:
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      dataBase64: docxBase64,
+    });
+
+    expect(fetch).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent",
+      ),
+      expect.any(Object),
+    );
+
+    const fetchCall = vi.mocked(fetch).mock.calls[0];
+    const body =
+      fetchCall?.[1] && "body" in fetchCall[1] ? fetchCall[1].body : "";
+    const parsedBody = JSON.parse(String(body)) as Record<string, unknown>;
+
+    expect(JSON.stringify(parsedBody)).not.toContain("inlineData");
+    expect(JSON.stringify(parsedBody)).not.toContain("input_file");
+
+    const contents = parsedBody.contents as Array<{
+      parts?: Array<{ text?: string }>;
+    }>;
+    expect(contents[0]?.parts?.[0]?.text).toContain(
+      "The resume file was uploaded as DOCX",
+    );
+    expect(contents[0]?.parts?.[0]?.text).toContain("Taylor Quinn");
+    expect(contents[0]?.parts?.[0]?.text).toContain("Senior Engineer");
+  });
+
+  it("repairs Gemini JSON with unescaped quotes inside description fields", async () => {
+    modelSelection.resolveLlmRuntimeSettings.mockResolvedValueOnce({
+      provider: "gemini",
+      model: "gemini-2.5-flash-lite",
+      baseUrl: null,
+      apiKey: "gemini-test",
+    });
+
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: `{"basics":{"name":"Taylor Quinn"},"sections":{"experience":{"items":[{"company":"Acme","position":"Engineer","description":"<ul><li>Led the "Employer Line" program.</li></ul>"}]}}}`,
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+
+    await importDesignResumeFromFile({
+      fileName: "resume.pdf",
+      mediaType: "application/pdf",
+      dataBase64: Buffer.from("pdf-data").toString("base64"),
+    });
+
+    const savedInput =
+      designResumeService.replaceCurrentDesignResumeDocument.mock.calls[0]?.[0];
+    const experienceItems =
+      savedInput?.resumeJson?.sections?.experience?.items ?? [];
+
+    expect(experienceItems).toHaveLength(1);
+    expect(experienceItems[0]).toMatchObject({
+      company: "Acme",
+      position: "Engineer",
+      description: '<ul><li>Led the "Employer Line" program.</li></ul>',
+    });
+  });
+
+  it("ignores Gemini thought parts when extracting resume JSON", async () => {
+    modelSelection.resolveLlmRuntimeSettings.mockResolvedValueOnce({
+      provider: "gemini",
+      model: "gemini-2.5-flash-lite",
+      baseUrl: null,
+      apiKey: "gemini-test",
+    });
+
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    thought: true,
+                    text: 'I should return {"not":"this"}',
+                  },
+                  {
+                    text: '{"basics":{"name":"Taylor Quinn"}}',
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+
+    await importDesignResumeFromFile({
+      fileName: "resume.pdf",
+      mediaType: "application/pdf",
+      dataBase64: Buffer.from("pdf-data").toString("base64"),
+    });
+
+    expect(
+      designResumeService.replaceCurrentDesignResumeDocument,
+    ).toHaveBeenCalledWith(
+      expect.objectContaining({
+        resumeJson: expect.objectContaining({
+          basics: expect.objectContaining({ name: "Taylor Quinn" }),
+        }),
+      }),
+    );
+  });
+
   it("accepts supported media types even when the file name has no extension", async () => {
     vi.mocked(fetch).mockResolvedValue(
       new Response(
@@ -184,6 +373,103 @@ describe("importDesignResumeFromFile", () => {
       "https://openrouter.ai/api/v1/chat/completions",
       expect.any(Object),
     );
+  });
+
+  it("uses the OpenRouter PDF parser instead of requiring native file input", async () => {
+    modelSelection.resolveLlmRuntimeSettings.mockResolvedValueOnce({
+      provider: "openrouter",
+      model: "google/gemini-3-flash-preview",
+      baseUrl: null,
+      apiKey: "or-test",
+    });
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: `{"basics":{"name":"Taylor Quinn"}}`,
+              },
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+
+    await importDesignResumeFromFile({
+      fileName: "resume.pdf",
+      mediaType: "application/pdf",
+      dataBase64: Buffer.from("pdf-data").toString("base64"),
+    });
+
+    const fetchCall = vi.mocked(fetch).mock.calls[0];
+    const body =
+      fetchCall?.[1] && "body" in fetchCall[1] ? fetchCall[1].body : "";
+    expect(String(body)).toContain('"engine":"cloudflare-ai"');
+    expect(String(body)).not.toContain('"engine":"native"');
+  });
+
+  it("retries OpenRouter PDF extraction with a fallback parser engine", async () => {
+    modelSelection.resolveLlmRuntimeSettings.mockResolvedValueOnce({
+      provider: "openrouter",
+      model: "google/gemini-3-flash-preview",
+      baseUrl: null,
+      apiKey: "or-test",
+    });
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              message: "PDF parser could not process this document.",
+            },
+          }),
+          {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: `{"basics":{"name":"Taylor Quinn"}}`,
+                },
+              },
+            ],
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        ),
+      );
+
+    await importDesignResumeFromFile({
+      fileName: "resume.pdf",
+      mediaType: "application/pdf",
+      dataBase64: Buffer.from("pdf-data").toString("base64"),
+    });
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    const firstCall = vi.mocked(fetch).mock.calls[0];
+    const secondCall = vi.mocked(fetch).mock.calls[1];
+    const firstInit = firstCall?.[1];
+    const secondInit = secondCall?.[1];
+    const firstBody =
+      firstInit && "body" in firstInit ? String(firstInit.body) : "";
+    const secondBody =
+      secondInit && "body" in secondInit ? String(secondInit.body) : "";
+
+    expect(firstBody).toContain('"engine":"cloudflare-ai"');
+    expect(secondBody).toContain('"engine":"mistral-ocr"');
   });
 
   it("allows a base64 payload exactly at the 10 MB limit", async () => {

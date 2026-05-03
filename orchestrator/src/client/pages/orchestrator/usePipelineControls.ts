@@ -1,10 +1,14 @@
 import * as api from "@client/api";
 import type { ManualImportResult } from "@client/components/ManualImportFlow";
 import { useSettings } from "@client/hooks/useSettings";
-import { getCompatibleSourcesForCountry } from "@shared/location-support.js";
+import {
+  createLocationIntent,
+  planLocationSources,
+} from "@shared/location-intelligence.js";
 import type { AppSettings, JobSource } from "@shared/types.js";
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
+import { showErrorToast } from "@/client/lib/error-toast";
 import { trackProductEvent } from "@/lib/analytics";
 import type { AutomaticRunValues } from "./automatic-run";
 import {
@@ -97,29 +101,28 @@ export function usePipelineControls(
       topN: number;
       minSuitabilityScore: number;
       sources: JobSource[];
-      analytics?: {
-        mode?: string;
-        country?: string;
-        hasCityLocations?: boolean;
-        searchTermsCount?: number;
-      };
+      runBudget: number;
+      searchTerms: string[];
+      country: string;
+      cityLocations: string[];
+      workplaceTypes: Array<"remote" | "hybrid" | "onsite">;
+      searchScope: AutomaticRunValues["searchScope"];
+      matchStrictness: AutomaticRunValues["matchStrictness"];
     }) => {
       try {
         setIsPipelineRunning(true);
         setIsCancelling(false);
-        trackProductEvent("jobs_pipeline_run_started", {
-          mode: config.analytics?.mode ?? "automatic",
-          source_count: config.sources.length,
-          top_n: config.topN,
-          min_suitability_score: config.minSuitabilityScore,
-          country: config.analytics?.country,
-          has_city_locations: config.analytics?.hasCityLocations,
-          search_terms_count: config.analytics?.searchTermsCount,
-        });
         await api.runPipeline({
           topN: config.topN,
           minSuitabilityScore: config.minSuitabilityScore,
           sources: config.sources,
+          runBudget: config.runBudget,
+          searchTerms: config.searchTerms,
+          country: config.country,
+          cityLocations: config.cityLocations,
+          workplaceTypes: config.workplaceTypes,
+          searchScope: config.searchScope,
+          matchStrictness: config.matchStrictness,
         });
         toast.message("Pipeline started", {
           description: `Sources: ${config.sources.join(", ")}. This may take a few minutes.`,
@@ -127,9 +130,7 @@ export function usePipelineControls(
       } catch (error) {
         setIsPipelineRunning(false);
         setIsCancelling(false);
-        const message =
-          error instanceof Error ? error.message : "Failed to start pipeline";
-        toast.error(message);
+        showErrorToast(error, "Failed to start pipeline");
       }
     },
     [setIsPipelineRunning],
@@ -147,21 +148,37 @@ export function usePipelineControls(
       toast.message(result.message);
     } catch (error) {
       setIsCancelling(false);
-      const message =
-        error instanceof Error ? error.message : "Failed to cancel pipeline";
-      toast.error(message);
+      showErrorToast(error, "Failed to cancel pipeline");
     }
   }, [isCancelling, isPipelineRunning]);
 
   const handleSaveAndRunAutomatic = useCallback(
     async (values: AutomaticRunValues) => {
-      const compatibleSources = getCompatibleSourcesForCountry(
-        pipelineSources,
-        values.country,
-      );
+      const locationIntent = createLocationIntent({
+        selectedCountry: values.country,
+        cityLocations: values.cityLocations,
+        workplaceTypes: values.workplaceTypes,
+        searchScope: values.searchScope,
+        matchStrictness: values.matchStrictness,
+      });
+      const sourcePlan = planLocationSources({
+        intent: locationIntent,
+        sources: pipelineSources,
+      });
+      const incompatiblePlans = sourcePlan.plans.filter((plan) => !plan.canRun);
+      const compatibleSources = sourcePlan.compatibleSources as JobSource[];
+
+      if (incompatiblePlans.length > 0) {
+        toast.error(
+          incompatiblePlans[0]?.reasons[0] ??
+            "Some selected sources do not support this location setup.",
+        );
+        return;
+      }
+
       if (compatibleSources.length === 0) {
         toast.error(
-          "No compatible sources for the selected country. Choose another country or source.",
+          "No compatible sources for the selected location setup. Choose another country, city, or source.",
         );
         return;
       }
@@ -182,20 +199,17 @@ export function usePipelineControls(
         ukvisajobsMaxJobs: limits.ukvisajobsMaxJobs,
         adzunaMaxJobsPerTerm: limits.adzunaMaxJobsPerTerm,
         startupjobsMaxJobsPerTerm: limits.startupjobsMaxJobsPerTerm,
+        seekMaxJobsPerTerm: limits.seekMaxJobsPerTerm,
+        naukriMaxJobsPerTerm: limits.naukriMaxJobsPerTerm,
         jobspyCountryIndeed: values.country,
         searchCities,
       });
       await refreshSettings();
       await startPipelineRun({
+        ...values,
+        sources: compatibleSources,
         topN: values.topN,
         minSuitabilityScore: values.minSuitabilityScore,
-        sources: compatibleSources,
-        analytics: {
-          mode: "automatic",
-          country: values.country,
-          hasCityLocations: values.cityLocations.length > 0,
-          searchTermsCount: values.searchTerms.length,
-        },
       });
       setIsRunModeModalOpen(false);
     },
@@ -204,8 +218,7 @@ export function usePipelineControls(
 
   const handleManualImported = useCallback(
     async (imported: ManualImportResult) => {
-      trackProductEvent("jobs_pipeline_run_started", {
-        mode: "manual_import",
+      trackProductEvent("jobs_manual_import_completed", {
         manual_import_source: imported.source,
         manual_import_source_host: imported.sourceHost ?? undefined,
       });

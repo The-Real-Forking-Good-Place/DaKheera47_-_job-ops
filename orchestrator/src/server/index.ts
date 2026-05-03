@@ -9,13 +9,16 @@ import { createApp } from "./app";
 import { initializeExtractorRegistry } from "./extractors/registry";
 import { deleteExpiredOrRevokedAuthSessions } from "./repositories/auth-sessions";
 import * as settingsRepo from "./repositories/settings";
+import { initializeActivationAnalyticsSafely } from "./services/activation-funnel";
 import {
   getBackupSettings,
   setBackupSettings,
   startBackupScheduler,
 } from "./services/backup/index";
+import { attachChallengeViewerUpgradeProxy } from "./services/challenge-viewer";
 import { initializeDemoModeServices } from "./services/demo-mode";
 import { applyStoredEnvOverrides } from "./services/envSettings";
+import { initializeHistoricalServerEventReplaySafely } from "./services/historical-product-analytics";
 import { initialize as initializeVisaSponsors } from "./services/visa-sponsors/index";
 
 const AUTH_SESSION_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
@@ -58,7 +61,7 @@ async function startServer() {
   const PORT = process.env.PORT || 3001;
 
   // Start server
-  app.listen(PORT, async () => {
+  const server = app.listen(PORT, async () => {
     console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ║                                                           ║
@@ -147,7 +150,11 @@ async function startServer() {
         error: sanitizeUnknown(error),
       });
     }
+
+    void initializeHistoricalServerEventReplaySafely();
+    void initializeActivationAnalyticsSafely();
   });
+  attachChallengeViewerUpgradeProxy(server);
 }
 
 void startServer();

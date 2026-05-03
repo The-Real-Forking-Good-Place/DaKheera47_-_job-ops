@@ -12,6 +12,7 @@ import {
 import type { JobSource } from "@shared/types";
 
 export type AutomaticPresetId = "fast" | "balanced" | "detailed";
+export type AutomaticPresetSelection = AutomaticPresetId | "custom";
 export type WorkplaceType = "remote" | "hybrid" | "onsite";
 export const WORKPLACE_TYPE_OPTIONS: WorkplaceType[] = [
   "remote",
@@ -47,6 +48,17 @@ export interface AutomaticEstimate {
     min: number;
     max: number;
   };
+}
+
+function isAutomaticPresetSelection(
+  value: unknown,
+): value is AutomaticPresetSelection {
+  return (
+    value === "custom" ||
+    value === "fast" ||
+    value === "balanced" ||
+    value === "detailed"
+  );
 }
 
 export const AUTOMATIC_PRESETS: Record<
@@ -107,6 +119,8 @@ export const MATCH_STRICTNESS_OPTIONS: Array<{
 export interface AutomaticRunMemory {
   topN: number;
   minSuitabilityScore: number;
+  presetId?: AutomaticPresetSelection;
+  runBudget?: number;
 }
 
 export function normalizeWorkplaceTypes(
@@ -132,6 +146,44 @@ export interface ExtractorLimits {
   adzunaMaxJobsPerTerm: number;
   startupjobsMaxJobsPerTerm: number;
   workingnomadsMaxJobsPerTerm: number;
+  seekMaxJobsPerTerm: number;
+  naukriMaxJobsPerTerm: number;
+}
+
+export function inferAutomaticPresetSelection(args: {
+  topN: number;
+  minSuitabilityScore: number;
+  runBudget?: number | null;
+}): AutomaticPresetSelection {
+  const hasRunBudget = args.runBudget !== null && args.runBudget !== undefined;
+
+  if (
+    args.topN === AUTOMATIC_PRESETS.fast.topN &&
+    args.minSuitabilityScore === AUTOMATIC_PRESETS.fast.minSuitabilityScore &&
+    (!hasRunBudget || args.runBudget === AUTOMATIC_PRESETS.fast.runBudget)
+  ) {
+    return "fast";
+  }
+
+  if (
+    args.topN === AUTOMATIC_PRESETS.balanced.topN &&
+    args.minSuitabilityScore ===
+      AUTOMATIC_PRESETS.balanced.minSuitabilityScore &&
+    (!hasRunBudget || args.runBudget === AUTOMATIC_PRESETS.balanced.runBudget)
+  ) {
+    return "balanced";
+  }
+
+  if (
+    args.topN === AUTOMATIC_PRESETS.detailed.topN &&
+    args.minSuitabilityScore ===
+      AUTOMATIC_PRESETS.detailed.minSuitabilityScore &&
+    (!hasRunBudget || args.runBudget === AUTOMATIC_PRESETS.detailed.runBudget)
+  ) {
+    return "detailed";
+  }
+
+  return "custom";
 }
 
 export function deriveExtractorLimits(args: {
@@ -150,6 +202,8 @@ export function deriveExtractorLimits(args: {
   const includesHiringCafe = args.sources.includes("hiringcafe");
   const includesStartupJobs = args.sources.includes("startupjobs");
   const includesWorkingNomads = args.sources.includes("workingnomads");
+  const includesSeek = args.sources.includes("seek");
+  const includesNaukri = args.sources.includes("naukri");
 
   const weightedContributors =
     (includesIndeed ? termCount : 0) +
@@ -160,7 +214,9 @@ export function deriveExtractorLimits(args: {
     (includesAdzuna ? termCount : 0) +
     (includesHiringCafe ? termCount : 0) +
     (includesStartupJobs ? termCount : 0) +
-    (includesWorkingNomads ? termCount : 0);
+    (includesWorkingNomads ? termCount : 0) +
+    (includesSeek ? termCount : 0) +
+    (includesNaukri ? termCount : 0);
 
   if (weightedContributors <= 0) {
     return {
@@ -170,6 +226,8 @@ export function deriveExtractorLimits(args: {
       adzunaMaxJobsPerTerm: budget,
       startupjobsMaxJobsPerTerm: budget,
       workingnomadsMaxJobsPerTerm: budget,
+      seekMaxJobsPerTerm: budget,
+      naukriMaxJobsPerTerm: budget,
     };
   }
 
@@ -183,6 +241,8 @@ export function deriveExtractorLimits(args: {
     adzunaMaxJobsPerTerm: perUnit,
     startupjobsMaxJobsPerTerm: perUnit,
     workingnomadsMaxJobsPerTerm: perUnit,
+    seekMaxJobsPerTerm: perUnit,
+    naukriMaxJobsPerTerm: perUnit,
   };
 }
 
@@ -268,6 +328,8 @@ export function calculateAutomaticEstimate(args: {
   const hasHiringCafe = sources.includes("hiringcafe");
   const hasStartupJobs = sources.includes("startupjobs");
   const hasWorkingNomads = sources.includes("workingnomads");
+  const hasSeek = sources.includes("seek");
+  const hasNaukri = sources.includes("naukri");
   const limits = deriveExtractorLimits({
     budget: values.runBudget,
     searchTerms: values.searchTerms,
@@ -292,6 +354,8 @@ export function calculateAutomaticEstimate(args: {
   const workingNomadsCap = hasWorkingNomads
     ? limits.workingnomadsMaxJobsPerTerm * termCount
     : 0;
+  const seekCap = hasSeek ? limits.seekMaxJobsPerTerm * termCount : 0;
+  const naukriCap = hasNaukri ? limits.naukriMaxJobsPerTerm * termCount : 0;
 
   const discoveredCap =
     jobspyCap +
@@ -300,7 +364,9 @@ export function calculateAutomaticEstimate(args: {
     adzunaCap +
     hiringCafeCap +
     startupJobsCap +
-    workingNomadsCap;
+    workingNomadsCap +
+    seekCap +
+    naukriCap;
   const discoveredMin = Math.round(discoveredCap * 0.35);
   const discoveredMax = Math.round(discoveredCap * 0.75);
   const processedMin = Math.min(values.topN, discoveredMin);
@@ -323,19 +389,66 @@ export function loadAutomaticRunMemory(): AutomaticRunMemory | null {
   try {
     const raw = localStorage.getItem(RUN_MEMORY_STORAGE_KEY);
     if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<AutomaticRunMemory>;
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
     if (
       typeof parsed.topN !== "number" ||
       typeof parsed.minSuitabilityScore !== "number"
     ) {
       return null;
     }
+    const topN = Math.min(50, Math.max(1, Math.round(parsed.topN)));
+    const minSuitabilityScore = Math.min(
+      100,
+      Math.max(0, Math.round(parsed.minSuitabilityScore)),
+    );
+    const runBudget =
+      typeof parsed.runBudget === "number"
+        ? Math.max(50, Math.round(parsed.runBudget))
+        : undefined;
+    const explicitPresetId = isAutomaticPresetSelection(parsed.presetId)
+      ? parsed.presetId
+      : null;
+
+    if (explicitPresetId && explicitPresetId !== "custom") {
+      const preset = AUTOMATIC_PRESETS[explicitPresetId];
+      return {
+        topN: preset.topN,
+        minSuitabilityScore: preset.minSuitabilityScore,
+        runBudget: preset.runBudget,
+        presetId: explicitPresetId,
+      };
+    }
+
+    if (explicitPresetId === "custom") {
+      return {
+        topN,
+        minSuitabilityScore,
+        ...(runBudget !== undefined ? { runBudget } : {}),
+        presetId: "custom",
+      };
+    }
+
+    const inferredPresetId = inferAutomaticPresetSelection({
+      topN,
+      minSuitabilityScore,
+      runBudget,
+    });
+
+    if (inferredPresetId !== "custom") {
+      const preset = AUTOMATIC_PRESETS[inferredPresetId];
+      return {
+        topN: preset.topN,
+        minSuitabilityScore: preset.minSuitabilityScore,
+        runBudget: preset.runBudget,
+        presetId: inferredPresetId,
+      };
+    }
+
     return {
-      topN: Math.min(50, Math.max(1, Math.round(parsed.topN))),
-      minSuitabilityScore: Math.min(
-        100,
-        Math.max(0, Math.round(parsed.minSuitabilityScore)),
-      ),
+      topN,
+      minSuitabilityScore,
+      ...(runBudget !== undefined ? { runBudget } : {}),
+      presetId: "custom",
     };
   } catch {
     return null;

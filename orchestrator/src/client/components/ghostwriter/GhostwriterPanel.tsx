@@ -10,6 +10,7 @@ import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { toast } from "sonner";
+import { showErrorToast } from "@/client/lib/error-toast";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -27,9 +28,15 @@ import { MessageList } from "./MessageList";
 
 type GhostwriterPanelProps = {
   job: Job;
+  initialPrompt?: string | null;
+  onInitialPromptConsumed?: () => void;
 };
 
-export const GhostwriterPanel: React.FC<GhostwriterPanelProps> = ({ job }) => {
+export const GhostwriterPanel: React.FC<GhostwriterPanelProps> = ({
+  job,
+  initialPrompt,
+  onInitialPromptConsumed,
+}) => {
   const [messages, setMessages] = useState<JobChatMessage[]>([]);
   const [branches, setBranches] = useState<BranchInfo[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -43,6 +50,7 @@ export const GhostwriterPanel: React.FC<GhostwriterPanelProps> = ({ job }) => {
 
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
+  const consumedInitialPromptRef = useRef<string | null>(null);
   const runTriggerRef = useRef<"new_prompt" | "regenerate" | "edit">(
     "new_prompt",
   );
@@ -70,9 +78,7 @@ export const GhostwriterPanel: React.FC<GhostwriterPanelProps> = ({ job }) => {
     try {
       await loadMessages();
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Failed to load Ghostwriter";
-      toast.error(message);
+      showErrorToast(error, "Failed to load Ghostwriter");
     } finally {
       setIsLoading(false);
     }
@@ -206,9 +212,7 @@ export const GhostwriterPanel: React.FC<GhostwriterPanelProps> = ({ job }) => {
           return;
         }
 
-        const message =
-          error instanceof Error ? error.message : "Failed to send message";
-        toast.error(message);
+        showErrorToast(error, "Failed to send message");
       } finally {
         streamAbortRef.current = null;
         setIsStreaming(false);
@@ -228,9 +232,7 @@ export const GhostwriterPanel: React.FC<GhostwriterPanelProps> = ({ job }) => {
       setStreamingMessageId(null);
       await loadMessages();
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Failed to stop run";
-      toast.error(message);
+      showErrorToast(error, "Failed to stop run");
     }
   }, [activeRunId, job.id, loadMessages]);
 
@@ -264,11 +266,7 @@ export const GhostwriterPanel: React.FC<GhostwriterPanelProps> = ({ job }) => {
         if (error instanceof Error && error.name === "AbortError") {
           return;
         }
-        const message =
-          error instanceof Error
-            ? error.message
-            : "Failed to regenerate response";
-        toast.error(message);
+        showErrorToast(error, "Failed to regenerate response");
       } finally {
         streamAbortRef.current = null;
         setIsStreaming(false);
@@ -325,9 +323,7 @@ export const GhostwriterPanel: React.FC<GhostwriterPanelProps> = ({ job }) => {
         if (error instanceof Error && error.name === "AbortError") {
           return;
         }
-        const message =
-          error instanceof Error ? error.message : "Failed to edit message";
-        toast.error(message);
+        showErrorToast(error, "Failed to edit message");
       } finally {
         streamAbortRef.current = null;
         setIsStreaming(false);
@@ -343,9 +339,7 @@ export const GhostwriterPanel: React.FC<GhostwriterPanelProps> = ({ job }) => {
         setMessages(result.messages);
         setBranches(result.branches);
       } catch (error) {
-        const message =
-          error instanceof Error ? error.message : "Failed to switch branch";
-        toast.error(message);
+        showErrorToast(error, "Failed to switch branch");
       }
     },
     [job.id],
@@ -355,6 +349,22 @@ export const GhostwriterPanel: React.FC<GhostwriterPanelProps> = ({ job }) => {
     return !isStreaming && messages.length > 0;
   }, [isStreaming, messages]);
 
+  useEffect(() => {
+    const content = initialPrompt?.trim();
+    if (!content || isLoading || isStreaming) return;
+    if (consumedInitialPromptRef.current === content) return;
+
+    consumedInitialPromptRef.current = content;
+    onInitialPromptConsumed?.();
+    void sendMessage(content);
+  }, [
+    initialPrompt,
+    isLoading,
+    isStreaming,
+    onInitialPromptConsumed,
+    sendMessage,
+  ]);
+
   const resetConversation = useCallback(async () => {
     try {
       await api.resetJobGhostwriterConversation(job.id);
@@ -362,14 +372,12 @@ export const GhostwriterPanel: React.FC<GhostwriterPanelProps> = ({ job }) => {
       setBranches([]);
       toast.success("Conversation cleared");
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Failed to reset conversation";
-      toast.error(message);
+      showErrorToast(error, "Failed to reset conversation");
     }
   }, [job.id]);
 
   return (
-    <div className="flex h-full min-h-0 flex-1 flex-col">
+    <div className="flex h-full min-h-0 flex-1 flex-col max-w-6xl mx-auto">
       <div
         ref={messageListRef}
         className="min-h-0 flex-1 overflow-y-auto border-b border-border/50 pb-3 pr-1"
